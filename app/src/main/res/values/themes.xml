@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.BlazingJoker" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:statusBarColor">@color/bj_black</item>
+        <item name="android:navigationBarColor">@color/bj_black</item>
+        <item name="android:windowBackground">@color/bj_black</item>
+    </style>
+
+    <style name="Theme.BlazingJoker.Fullscreen" parent="Theme.BlazingJoker">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+</resources>

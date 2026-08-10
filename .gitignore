@@ -1,0 +1,22 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+app/build/
+*.apk
+*.aab
+*.aar
+
+# Local config
+local.properties
+*.iml
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keystore — NEVER commit signing keys to a public repo
+*.jks
+*.keystore
+keystore.properties
+signing/
