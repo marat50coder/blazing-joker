@@ -12,4 +12,15 @@
         <item name="android:windowFullscreen">true</item>
         <item name="android:windowContentOverlay">@null</item>
     </style>
+
+    <!--
+        Launch theme — used ONLY by the LoadingActivity manifest entry.
+        Extends the AndroidX SplashScreen compat theme so the Android 12+
+        system splash renders the adaptive icon without a white frame flash.
+    -->
+    <style name="Theme.BlazingJoker.Launch" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/link_launch_bg</item>
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+        <item name="postSplashScreenTheme">@style/Theme.BlazingJoker.Fullscreen</item>
+    </style>
 </resources>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Cleartext MUST be permitted in the WebView. Partner-provided push URLs
+    frequently ship as plain http:// links and are refused with
+    ERR_CLEARTEXT_NOT_PERMITTED under the API 28+ default. Whitelisting
+    individual hosts is a moving target; treat the shell as a browser.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

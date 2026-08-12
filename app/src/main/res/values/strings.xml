@@ -1,8 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Blazing Joker</string>
+
+    <!-- Native game strings -->
     <string name="play">PLAY</string>
     <string name="privacy_policy">Privacy Policy</string>
     <string name="support">Support</string>
     <string name="loading">Loading</string>
+
+    <!-- Gray flow strings -->
+    <string name="link_horn_channel_id">bj_link_horn_v1</string>
+    <string name="link_horn_channel_name">Updates</string>
+    <string name="link_horn_channel_desc">Announcements and offers</string>
+
+    <string name="alert_optin_title">Stay in the loop</string>
+    <string name="alert_optin_body">Get notified when a new round opens or a bonus lands.</string>
+    <string name="alert_optin_accept">Accept</string>
+    <string name="alert_optin_skip">Skip</string>
+
+    <string name="no_link_title">No connection</string>
+    <string name="no_link_body">Check Wi-Fi or mobile data and try again.</string>
+    <string name="no_link_retry">Retry</string>
 </resources>

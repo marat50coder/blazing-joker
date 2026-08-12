@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Game palette (unchanged) -->
     <color name="bj_purple_deep">#FF2A0E3F</color>
     <color name="bj_purple">#FF5A2A8F</color>
     <color name="bj_gold">#FFF6C13A</color>
@@ -11,4 +12,9 @@
     <color name="white">#FFFFFFFF</color>
     <color name="scrim">#99000000</color>
     <color name="track">#66000000</color>
+
+    <!-- Gray flow -->
+    <color name="link_horn_accent">#FFE86A19</color>
+    <!-- Launch background matches the icon's dark corners -->
+    <color name="link_launch_bg">#FF120616</color>
 </resources>
