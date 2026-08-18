@@ -1,18 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Notification small icon. Flame silhouette — deliberately different from
-    the launcher art (which is a masked circus mask). Reads clearly at
-    24×24 dp and passes Android's automatic status-bar tint.
+    Notification small icon. Solid white silhouette so the Android status
+    bar's automatic tint always renders it as the platform's own tray
+    glyph colour (white on the bar, dark on the expanded panel).
+
+    Two paths: an opaque outer tongue and a semi-transparent inner core
+    so the shape reads as fire and not as an amorphous white blob.
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
+
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M12.4,2.1c-0.3,-0.2 -0.7,-0.1 -0.9,0.2c-1.6,2.1 -2.7,3.9 -3.3,5.3c-0.4,0.9 -0.6,1.7 -0.7,2.5c-0.6,-0.5 -1.1,-1.1 -1.5,-1.9c-0.2,-0.4 -0.8,-0.4 -1,0c-1.2,2.1 -1.8,4 -1.8,5.7c0,4.5 3.4,7.9 8,7.9c4.7,0 8,-3.6 8,-8c0,-3.3 -2.2,-6.5 -6.8,-11.7zM12,19.8c-3.5,0 -6,-2.5 -6,-5.9c0,-1 0.2,-2.1 0.7,-3.3c0.6,0.7 1.4,1.2 2.3,1.5c0.4,0.1 0.8,-0.1 0.9,-0.5c0.2,-0.7 0.2,-1.5 0.6,-2.4c0.4,-1 1.2,-2.3 2.3,-4c3.5,4.1 5.2,6.7 5.2,9.1C18,17.5 15.7,19.8 12,19.8z" />
+        android:pathData="M12.4,2.1c-0.3,-0.2 -0.7,-0.1 -0.9,0.2c-1.6,2.1 -2.7,3.9 -3.3,5.3c-0.4,0.9 -0.6,1.7 -0.7,2.5c-0.6,-0.5 -1.1,-1.1 -1.5,-1.9c-0.2,-0.4 -0.8,-0.4 -1,0c-1.2,2.1 -1.8,4 -1.8,5.7c0,4.5 3.4,7.9 8,7.9c4.7,0 8,-3.6 8,-8c0,-3.3 -2.2,-6.5 -6.8,-11.7z" />
+
     <path
         android:fillColor="#FFFFFFFF"
+        android:fillAlpha="0.55"
         android:pathData="M12.6,10.9c-0.2,-0.3 -0.7,-0.3 -0.9,0c-0.7,0.9 -1.2,1.7 -1.5,2.5c-0.3,0.7 -0.4,1.4 -0.4,2c0,1.9 1.4,3.3 3.3,3.3c1.9,0 3.3,-1.4 3.3,-3.3C16.4,13.9 15.1,12.4 12.6,10.9z" />
 </vector>

@@ -1,8 +1,11 @@
 package com.blazingjoker.blazingjokergame.link
 
+import android.app.Activity
 import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.os.Build
+import android.util.Log
 import com.blazingjoker.blazingjokergame.link.config.LinkConfig
 import com.blazingjoker.blazingjokergame.link.data.Berth
 import com.blazingjoker.blazingjokergame.link.data.ChartAnswer
@@ -16,8 +19,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -55,55 +56,91 @@ internal class LinkPilot private constructor(
 
     private val ambientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /**
+     * Register the AppsFlyer SDK listeners (init + subscribeForDeepLink).
+     * Call from Activity.onCreate BEFORE any lifecycle callback fires,
+     * otherwise the SDK's ActivityLifecycleCallbacks miss the first
+     * onResume and conversion never fires until a later activity opens.
+     */
+    fun wireUp() {
+        runCatching { campaign.wireUp() }
+    }
+
+    /**
+     * Send the launch event. AppsFlyer REQUIRES an Activity here — passing
+     * the Application context queues the launch to the next transition
+     * (which in our shell is ~30 s later when MainMenu opens) and the
+     * conversion listener silently never fires.
+     */
+    fun start(host: Activity) {
+        runCatching { campaign.start(host) }
+    }
+
+    /**
+     * Hand a cold-tap or warm VIEW intent to the pipeline so URI-borne
+     * attribution (campaign, media_source, deep_link_value…) is captured
+     * even when the SDK stays silent.
+     */
+    fun notifyLaunchIntent(intent: Intent?) {
+        runCatching { campaign.notifyLaunchIntent(intent) }
+    }
+
     fun kickOffAmbient() {
         ambientScope.launch {
-            // These do not block routing but must run early so the token
-            // and installer signals are ready by the time we POST.
             runCatching { horn.boot() }
-            runCatching { campaign.boot() }
         }
     }
 
     suspend fun chart(onProgress: (Float) -> Unit = {}): Berth = gate.withLock {
+        Log.d(TAG, "chart() start; course=${stowage.course}; credentialsReady=${LinkConfig.credentialsReady}")
         try {
             if (!LinkConfig.credentialsReady) {
+                Log.w(TAG, "credentials empty → forcing NATIVE")
                 onProgress(1f)
                 return@withLock Berth.Native
             }
 
-            // Cold-tap push URL trumps everything.
             stowage.consumePendingUrl()?.let { url ->
+                Log.d(TAG, "cold-tap URL wins: $url")
                 stowage.course = LastCourse.Web
                 launchFireAndForget()
                 onProgress(1f)
                 return@withLock Berth.Web(url = url, fromColdPush = true)
             }
 
-            when (stowage.course) {
+            val berth = when (stowage.course) {
                 LastCourse.Unset -> decideFresh(onProgress)
                 LastCourse.Web -> decideReturningWeb(onProgress)
                 LastCourse.Native -> decideReturningNative(onProgress)
             }
-        } catch (_: Throwable) {
+            Log.d(TAG, "chart() → $berth")
+            berth
+        } catch (t: Throwable) {
+            Log.e(TAG, "chart() threw: ${t.message}", t)
             onProgress(1f)
             Berth.Native
         }
     }
 
     private suspend fun decideFresh(onProgress: (Float) -> Unit): Berth {
+        Log.d(TAG, "decideFresh: hasCarrier=${auditor.hasCarrier()}")
         if (!auditor.hasCarrier()) return Berth.LostSignal(previouslyOnNative = false)
         onProgress(pFirstCarrier)
 
-        // Boot subsystems in parallel — neither blocks the other.
-        awaitBoth(campaign::boot, horn::boot)
+        runCatching { horn.boot() }
+        Log.d(TAG, "decideFresh: horn booted; fcmToken=${horn.token?.take(24)}…")
 
-        if (!auditor.canRouteOut()) return Berth.LostSignal(previouslyOnNative = false)
+        val canRoute = auditor.canRouteOut()
+        Log.d(TAG, "decideFresh: canRouteOut=$canRoute")
+        if (!canRoute) return Berth.LostSignal(previouslyOnNative = false)
         onProgress(pFirstProbe)
 
         val installBag = campaign.awaitInstall(LinkConfig.FIRST_INSTALL_WAIT_MS)
+        Log.d(TAG, "decideFresh: attribution bag keys=${installBag.keys}; af_status=${installBag["af_status"]}; uriLaunched=${campaign.wasUriLaunched()}")
         onProgress(pFirstAttribution)
 
         val answer = askChart(installBag)
+        Log.d(TAG, "decideFresh: verdict approved=${answer.approved} url=${answer.url} note=${answer.note}")
         onProgress(pFirstVerdict)
 
         return if (answer.hasDestination) {
@@ -116,27 +153,43 @@ internal class LinkPilot private constructor(
     }
 
     private suspend fun decideReturningWeb(onProgress: (Float) -> Unit): Berth {
-        if (!auditor.hasCarrier()) return Berth.LostSignal(previouslyOnNative = false)
-
-        val cached = stowage.cachedDestination()
-        if (cached != null && !stowage.cachedDestinationExpired) {
-            onProgress(1f)
-            return Berth.Web(cached, fromColdPush = false)
-        }
-
-        awaitBoth(campaign::boot, horn::boot)
-        if (!auditor.canRouteOut()) {
+        if (!auditor.hasCarrier()) {
+            // No carrier at all — fall back to whatever we had last, or
+            // LostSignal if this is a fresh install with no cache.
+            val cached = stowage.cachedDestination()
             return cached?.let { Berth.Web(it, fromColdPush = false) }
                 ?: Berth.LostSignal(previouslyOnNative = false)
         }
 
+        val cached = stowage.cachedDestination()
+
+        runCatching { horn.boot() }
+        if (!auditor.canRouteOut()) {
+            // Route probe failed — cache is the only thing we have. Do NOT
+            // touch expiry here: an expired cache is still better than
+            // sending the user to the offline screen.
+            return cached?.let { Berth.Web(it, fromColdPush = false) }
+                ?: Berth.LostSignal(previouslyOnNative = false)
+        }
+
+        // Always re-ask the config endpoint on a returning session so a
+        // URL rotation on the backend reaches the user next launch. The
+        // cache is treated as a warm fallback for the network path, not
+        // as a "TTL: skip fetch" shortcut — that shortcut used to leave
+        // stale URLs on device for up to CACHED_DESTINATION_LIFETIME_SECONDS
+        // (~5.4 days) after a config change.
         val installBag = campaign.awaitInstall(LinkConfig.RETURN_INSTALL_WAIT_MS)
         onProgress(pReturnAttribution)
         val answer = askChart(installBag)
         onProgress(pReturnVerdict)
 
         if (answer.hasDestination) return Berth.Web(answer.url!!, fromColdPush = false)
-        return cached?.let { Berth.Web(it, fromColdPush = false) }
+        // Fresh fetch had no destination — fall back to the cached one
+        // (still valid for [CACHED_DESTINATION_LIFETIME_SECONDS]). Only
+        // if there is nothing to fall back to do we surrender.
+        return cached
+            ?.takeIf { !stowage.cachedDestinationExpired }
+            ?.let { Berth.Web(it, fromColdPush = false) }
             ?: Berth.LostSignal(previouslyOnNative = false)
     }
 
@@ -145,7 +198,7 @@ internal class LinkPilot private constructor(
             onProgress(1f)
             return Berth.Native
         }
-        awaitBoth(campaign::boot, horn::boot)
+        runCatching { horn.boot() }
         if (!auditor.canRouteOut()) {
             onProgress(1f)
             return Berth.Native
@@ -161,14 +214,51 @@ internal class LinkPilot private constructor(
 
     private suspend fun askChart(installBag: Map<String, Any?>): ChartAnswer {
         val body = JSONObject()
-        installBag.forEach { (k, v) -> body.putOpt(k, v) }
-        body.putOpt("af_id", campaign.deviceUid().orEmpty())
-        body.putOpt("bundle_id", LinkConfig.APPLICATION_ID)
-        body.putOpt("os", "Android")
-        body.putOpt("os_version", Build.VERSION.RELEASE)
-        body.putOpt("store_id", LinkConfig.STORE_ID)
-        body.putOpt("locale", Locale.getDefault().toString().replace('-', '_'))
-        body.putOpt("device_model", "${Build.BRAND} ${Build.MODEL}")
+
+        // Merge priority: real SDK attribution wins over URI query params
+        // wins over deep-link callback facts. This matches AppsFlyer's own
+        // recommendation and the backend's expected precedence.
+        installBag.forEach { (k, v) -> if (v != null) body.put(k, v) }
+        campaign.uriFacts().forEach { (k, v) -> if (!body.has(k) && v != null) body.put(k, v) }
+        campaign.deepLinkFacts().forEach { (k, v) -> if (!body.has(k) && v != null) body.put(k, v) }
+
+        // ── af_status resolution ────────────────────────────────────
+        // The backend rejects bodies without an af_status ("No data").
+        //
+        // AppsFlyer's conversion callback frequently mis-reports Organic
+        // on a fresh install even when we have hard evidence of a tracked
+        // entry: the OneLink resolver returned pid/campaign/af_sub*, or
+        // the app was launched via a VIEW intent carrying the OneLink URL.
+        // This "organic rescue" overrides that: if any hard signal fired,
+        // we upgrade the status to Non-organic before hitting config.php.
+        //
+        // Hard signals (any one is enough):
+        //   * OneLink deep-link resolver returned a non-empty payload
+        //     containing media_source / campaign / af_c_id / af_sub1-5 /
+        //     deep_link_value with a real value.
+        //   * The launch URI carried the same fields as query params.
+        val hardSignal = hasMarketingHardSignal(campaign.deepLinkFacts()) ||
+            hasMarketingHardSignal(campaign.uriFacts())
+        val reported = body.optString("af_status").takeIf { it.isNotEmpty() }
+        val effective = when {
+            hardSignal -> "Non-organic"
+            reported != null -> reported
+            campaign.wasUriLaunched() -> "Non-organic"
+            else -> "Organic"
+        }
+        body.put("af_status", effective)
+        Log.d(
+            TAG,
+            "af_status resolved to $effective (reported=$reported hardSignal=$hardSignal uri=${campaign.wasUriLaunched()})",
+        )
+
+        body.put("af_id", campaign.deviceUid().orEmpty())
+        body.put("bundle_id", LinkConfig.APPLICATION_ID)
+        body.put("os", "Android")
+        body.put("os_version", Build.VERSION.RELEASE)
+        body.put("store_id", LinkConfig.STORE_ID)
+        body.put("locale", Locale.getDefault().toString().replace('-', '_'))
+        body.put("device_model", "${Build.BRAND} ${Build.MODEL}")
 
         val fcmToken = horn.token
         if (!fcmToken.isNullOrEmpty()) body.put("push_token", fcmToken)
@@ -178,25 +268,47 @@ internal class LinkPilot private constructor(
         return fetcher.ask(body)
     }
 
+    /**
+     * True if the map carries a non-empty value in ANY of the fields that
+     * AppsFlyer only fills when a real tracked click landed. Presence of
+     * even one is enough to declare the install non-organic.
+     */
+    private fun hasMarketingHardSignal(facts: Map<String, Any?>): Boolean {
+        if (facts.isEmpty()) return false
+        return MARKETING_HARD_SIGNAL_KEYS.any { key ->
+            val v = facts[key]?.toString().orEmpty()
+            v.isNotEmpty() && !v.equals("null", ignoreCase = true)
+        }
+    }
+
     private fun launchFireAndForget(): Job = ambientScope.launch {
-        // Ambient chart refresh so the backend records the cold-tap event.
         runCatching {
-            awaitBoth(campaign::boot, horn::boot)
+            horn.boot()
             val installBag = campaign.awaitInstall(LinkConfig.RETURN_INSTALL_WAIT_MS)
             askChart(installBag)
         }
     }
 
-    private suspend fun awaitBoth(a: suspend () -> Unit, b: suspend () -> Unit) {
-        val scope = CoroutineScope(Dispatchers.IO)
-        val jobs = listOf(
-            scope.async { runCatching { a() } },
-            scope.async { runCatching { b() } },
-        )
-        jobs.awaitAll()
-    }
-
     companion object {
+        private const val TAG = "LinkPilot"
+
+        // Fields that AppsFlyer's OneLink resolver / conversion callback
+        // only fills when a real tracked click hit their servers. Any one
+        // of them carrying a non-empty value overrides an "Organic" verdict.
+        private val MARKETING_HARD_SIGNAL_KEYS = setOf(
+            "media_source", "pid",
+            "campaign", "c",
+            "campaign_id", "af_c_id",
+            "af_adset", "adset",
+            "af_ad", "af_ad_id",
+            "af_sub1", "af_sub2", "af_sub3", "af_sub4", "af_sub5",
+            "af_siteid", "siteid",
+            "af_channel",
+            "deep_link_value", "deep_link_sub1",
+            "agency",
+            "af_prt", "af_keywords",
+        )
+
         @Volatile
         private var singleton: LinkPilot? = null
         private val lock = Any()

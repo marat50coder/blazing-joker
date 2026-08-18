@@ -10,12 +10,15 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkRequest
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.content.res.ColorStateList
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.PermissionRequest
 import android.webkit.SslErrorHandler
@@ -32,6 +35,9 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import com.blazingjoker.blazingjokergame.Ui
 import com.blazingjoker.blazingjokergame.dp
 import com.blazingjoker.blazingjokergame.link.LinkPilot
@@ -41,33 +47,72 @@ import com.blazingjoker.blazingjokergame.link.net.AgentForge
 /**
  * The WebView shell — the gray surface.
  *
- * Hosts a system WebView with:
- *   • forged UA (identical to the HTTP client's UA, via AgentForge)
- *   • cookies enabled (partner sessions require it)
- *   • JavaScript enabled + DOM storage
- *   • file-chooser bridge via `WebChromeClient.onShowFileChooser`
- *   • external-scheme hand-off (tel:, mailto:, market:, intent:)
- *   • redirect-loop recovery (`ERR_TOO_MANY_REDIRECTS`, `-1007`, `-9`)
- *   • live carrier-drop guard, debounced so a VPN reconnect blip doesn't
- *     bounce the user to the No-Link screen
- *
- * There is NO client-side classification of what the partner site is
- * showing. No `deposit / login / register / cashier` regex anywhere. Any
- * business funnel MUST live server-side. Ship a review with any of those
- * literals in this file and the app comes right back.
+ * Layout invariants (see the comments in [onCreate]):
+ *   • The window is edge-to-edge with cutout `SHORT_EDGES`; the OUTER
+ *     [FrameLayout] is painted solid black so the status/nav strips look
+ *     like real bezel in either orientation.
+ *   • A dedicated INSET container carries the safe-area padding and
+ *     hosts the WebView + spinner. Orientation change re-applies insets.
+ *   • A BLACK COVER sits above the WebView until the very first main-
+ *     frame page actually commits. Chromium's default error page
+ *     (`net::ERR_TOO_MANY_REDIRECTS`, `INTERNET_DISCONNECTED`, the robot
+ *     glyph, etc.) is thus never visible — the user sees either black
+ *     that turns into real content, or black that turns into NoLink.
  */
 class WebCanvasActivity : AppCompatActivity() {
 
     private lateinit var web: WebView
-    private lateinit var spinner: ProgressBar
+    private lateinit var cover: FrameLayout
     private lateinit var root: FrameLayout
+    private lateinit var safeHost: FrameLayout
 
     private var lastMainFrameUrl: String? = null
-    private var redirectRetryCount = 0
     private var offlineShown = false
+    private var pageReady = false
+
+    // True once a page has actually stayed on screen. Until then every
+    // main-frame `onPageStarted` is treated as another hop of the entry
+    // redirect chain — the cover stays up and the user only ever sees the
+    // final destination. After the first settled page, ordinary
+    // navigations resolve behind the page the user is already reading.
+    private var chainSettled = false
+
+    // Deepest main-frame URL Chromium was seen driving to, settled or not.
+    // Affiliate redirect chains routinely blow past Chromium's 20-hop
+    // safety limit; resuming from here keeps the cookies picked up along
+    // the way, whereas restarting from the entry URL just walks the same
+    // loop and burns the budget on identical hops.
+    private var farthestHop: String? = null
+
+    // How many times we have resumed the redirect chain from
+    // [farthestHop] on this Activity instance. Each resume buys another
+    // 20-hop budget from Chromium; [REDIRECT_LOOP_BUDGET] is how many of
+    // those we allow before falling back to the entry URL.
+    private var redirectRetries = 0
+
+    // One fallback to the configured entry URL per settled page.
+    private var entryPointRetried = false
+
+    // A recovery reload is in flight — do NOT surrender from connectivity
+    // flips until it commits (or a fresh error fires). Cleared by the very
+    // next successful `onPageFinished`.
+    private var retryPending = false
+
+    // Reset on every `onPageStarted`, set inside `onReceivedError`. Guards
+    // against the case where Chromium still calls `onPageFinished` on a
+    // navigation that produced a hard error (ERR_TOO_MANY_REDIRECTS and
+    // friends): without this flag, `onPageFinished` would drop the black
+    // cover — the user briefly sees the native Chromium error page.
+    private var hasErroredThisLoad = false
+    private lateinit var kbd: KbdSlide
     private var carrierWatcher: ConnectivityManager.NetworkCallback? = null
     private val handler = Handler(Looper.getMainLooper())
     private val dropDebounce = Runnable { forwardToOffline() }
+    private val coverTimeout = Runnable {
+        // Safety net for a page that never reports back — never leave the
+        // user under an opaque overlay for longer than [COVER_MAX_MS].
+        if (cover.visibility == View.VISIBLE) hideCover()
+    }
 
     private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
 
@@ -92,6 +137,17 @@ class WebCanvasActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Edge-to-edge so the WebView can extend under the status/nav
+        // strips; the safe-area padding below re-establishes a bezel
+        // that never covers content.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
         Ui.immersive(this)
 
         root = FrameLayout(this).apply {
@@ -102,29 +158,114 @@ class WebCanvasActivity : AppCompatActivity() {
             setBackgroundColor(Color.BLACK)
         }
 
-        web = WebView(this).apply {
+        safeHost = FrameLayout(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
             setBackgroundColor(Color.BLACK)
+        }
+        root.addView(safeHost)
+
+        web = WebView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            // White — matches the light theme of most partner surfaces
+            // so the first paint doesn't flash black before the DOM
+            // resolves.
+            setBackgroundColor(Color.WHITE)
+            // Focus flags required for the IME to open when a text field
+            // is tapped inside the WebView — without both, Android files
+            // the tap but never asks for input.
+            isFocusable = true
+            isFocusableInTouchMode = true
             configureWeb(this)
         }
-        root.addView(web)
+        safeHost.addView(web)
 
-        spinner = ProgressBar(this).apply {
-            isIndeterminate = true
-            val lp = FrameLayout.LayoutParams(56.dp, 56.dp)
-            lp.gravity = Gravity.CENTER
-            layoutParams = lp
+        // Keyboard slider — moves the WebView via translationY instead of
+        // letting Chromium shrink the viewport (which double-scrolls the
+        // focused field and reads as "input running away from caret").
+        // Same technique as magma-coins' KbdSlide / Coin_Pulse's ImeSlider.
+        //
+        // `onImeChange` fires on the IME animation's prepare AND end. Both
+        // must re-assert immersive: Android reveals the status bar the
+        // moment the IME opens, and if we don't hide it back the decorView
+        // height changes DURING the ride and KbdSlide's `slide()` picks up
+        // a different `span`, pushing the WebView too far up. The reassert
+        // is idempotent (WindowInsetsController's `hide()` is a no-op when
+        // the bar is already hidden), so calling it repeatedly is cheap.
+        kbd = KbdSlide(window.decorView, onImeChange = { Ui.immersive(this) }).also {
+            it.attach()
+            it.follow(web)
         }
-        root.addView(spinner)
+
+        // The cover is deliberately the LAST child of root (above the
+        // safe host) so it can hide the WebView's own paint until we
+        // know a real page has committed. The spinner lives INSIDE the
+        // cover so the user sees a black-and-loading screen rather than a
+        // silent black rectangle — same shape as `foollegends/StreamPortal`
+        // and `magma-coins/StreamActivity`.
+        cover = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            setBackgroundColor(Color.BLACK)
+            isClickable = true
+            addView(
+                ProgressBar(this@WebCanvasActivity).apply {
+                    isIndeterminate = true
+                    indeterminateTintList = ColorStateList.valueOf(COVER_ACCENT)
+                },
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER,
+                ),
+            )
+        }
+        root.addView(cover)
+        // Arm the timeout up front — the first `onPageFinished` for a
+        // real page cancels it, otherwise it lifts the cover on its own.
+        handler.postDelayed(coverTimeout, COVER_MAX_MS)
+
+        // Applied to safeHost only — root stays fully painted so the
+        // strips look like device bezel regardless of orientation.
+        //
+        // NB: bottom padding is deliberately ZERO. If the WebView stops
+        // short of the window bottom by `bars.bottom` (nav bar height),
+        // [KbdSlide] over-lifts by exactly that amount — the class reads
+        // the IME height from `decorView.bottom` but computes the target
+        // as `webView.height - imeH`, and the two are only equal when the
+        // WebView reaches all the way to `decorView.bottom`. Same setup
+        // in `foollegends/StreamPortal.applyInsets` and
+        // `magma-coins/StreamActivity.installCutoutPadding`.
+        ViewCompat.setOnApplyWindowInsetsListener(safeHost) { view, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or
+                    WindowInsetsCompat.Type.displayCutout()
+            )
+            view.setPadding(bars.left, bars.top, bars.right, 0)
+            insets
+        }
 
         setContentView(root)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (web.canGoBack()) web.goBack() else finishAffinity()
+                // History present → step back through the WebView.
+                // Empty history → silently swallow the press. Calling
+                // `finish()` or `finishAffinity()` here would close the
+                // Activity, and the launcher callback in LoadingActivity
+                // would read that as a natural finish and re-run the boot
+                // pipeline from scratch (or worse, kill the whole app).
+                // Sibling shells (`foollegends/StreamPortal`,
+                // `magma-coins/StreamActivity`) also just consume the press;
+                // if the user wants to leave, HOME / recents does the job.
+                if (web.canGoBack()) web.goBack()
             }
         })
 
@@ -159,13 +300,59 @@ class WebCanvasActivity : AppCompatActivity() {
 
         w.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                spinner.visibility = View.VISIBLE
+                // Fresh navigation — reset the error latch so the next
+                // `onPageFinished` can lift the cover if the load succeeds.
+                hasErroredThisLoad = false
+                if (!url.isNullOrBlank() && url != BLANK) {
+                    farthestHop = url
+                }
+                // Every hop of the entry chain gets a cover; once a page
+                // has settled, ordinary navigations resolve behind the page
+                // the user is already reading and DO NOT bring the cover
+                // back — that would look like the app blinking to black in
+                // the middle of a session.
+                if (!chainSettled && !url.isNullOrBlank() && url != BLANK) {
+                    showCover()
+                }
+                // The mid-session recovery path may have hidden the
+                // WebView after an errored click; make sure it's back
+                // before Chromium tries to paint the retry.
+                if (web.visibility != View.VISIBLE) web.visibility = View.VISIBLE
+                // Every navigation gives Chromium an excuse to reveal the
+                // status/nav bars (WebView takes focus internally without
+                // the Activity window ever losing focus, so onWindowFocus-
+                // Changed never fires and immersive isn't re-asserted).
+                // Re-hide the bars now and again in onPageFinished so the
+                // KbdSlide math (which assumes stable decorView height)
+                // isn't blindsided by a fresh top-inset appearing.
+                Ui.immersive(this@WebCanvasActivity)
+                // Any new page has nothing focused — clear the last field
+                // position so the slider resets to 0 before the new page's
+                // own focus event fires.
+                kbd.forgetField()
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
-                spinner.visibility = View.GONE
-                redirectRetryCount = 0
+                Ui.immersive(this@WebCanvasActivity)
+                // A finish that follows a main-frame error is Chromium
+                // wrapping up the failed navigation — the recovery reload
+                // has not committed yet, so do NOT drop the cover or reset
+                // the retry budget on top of it.
+                if (hasErroredThisLoad || url.isNullOrBlank() || url == BLANK) return
+                pageReady = true
+                chainSettled = true
+                lastMainFrameUrl = url
+                farthestHop = url
+                // A page that stayed is the end of a chain — the next
+                // `onReceivedError` gets a fresh retry budget.
+                redirectRetries = 0
+                entryPointRetried = false
+                retryPending = false
+                hideCover()
                 view?.let { LensInjector.installAll(it) }
+                // Install the field-position probe once per document —
+                // idempotent thanks to the `MARK` guard inside the script.
+                view?.evaluateJavascript(kbd.probe, null)
             }
 
             override fun shouldOverrideUrlLoading(
@@ -173,7 +360,13 @@ class WebCanvasActivity : AppCompatActivity() {
                 request: WebResourceRequest?,
             ): Boolean {
                 val uri = request?.url ?: return false
-                if (request.isForMainFrame) lastMainFrameUrl = uri.toString()
+                if (request.isForMainFrame) {
+                    lastMainFrameUrl = uri.toString()
+                    farthestHop = uri.toString()
+                    // A user tap is proof a real page is on screen — the
+                    // next load is a navigation, not another entry hop.
+                    if (request.hasGesture()) chainSettled = true
+                }
                 val scheme = uri.scheme?.lowercase()
                 val inApp = scheme == "http" || scheme == "https" || scheme == "about" ||
                     scheme == "data" || scheme == "blob"
@@ -188,33 +381,61 @@ class WebCanvasActivity : AppCompatActivity() {
                 error: WebResourceError?,
             ) {
                 if (request?.isForMainFrame != true) return
-                val code = error?.errorCode ?: 0
-                val desc = error?.description?.toString()?.lowercase().orEmpty()
 
-                val isLoop = code == ERROR_REDIRECT_LOOP ||
-                    desc.contains("too_many_redirects") ||
-                    desc.contains("too many redirects")
-                if (isLoop && lastMainFrameUrl != null &&
-                    redirectRetryCount < LinkConfig.REDIRECT_LOOP_RETRIES) {
-                    redirectRetryCount++
-                    view?.loadUrl(lastMainFrameUrl!!)
+                // Latch the error so the trailing `onPageFinished` for
+                // this same navigation does NOT flip pageReady=true and
+                // uncover the Chromium error page.
+                hasErroredThisLoad = true
+
+                // Belt-and-braces: even if the cover somehow lost its
+                // priority (mid-session error after `pageReady` had lifted
+                // it), hiding the WebView itself guarantees the native
+                // Chromium error chrome cannot leak into the frame.
+                web.visibility = View.INVISIBLE
+                showCover()
+
+                val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                    error?.errorCode ?: 0 else 0
+                val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                    error?.description?.toString().orEmpty() else ""
+
+                // Chromium's 20-hop safety limit — expected for the
+                // affiliate redirect chain the hosted surface kicks off.
+                // Resume from the deepest hop, NOT from lastMainFrameUrl
+                // (that walks the same hops again and burns the budget on
+                // the identical loop).
+                //   -9    = WebViewClient.ERROR_REDIRECT_LOOP
+                //   -1007 = Chromium's ERR_TOO_MANY_REDIRECTS on some ROMs
+                val loopish = code == ERROR_REDIRECT_LOOP || code == -1007 ||
+                    desc.contains("too_many", ignoreCase = true) ||
+                    desc.contains("REDIRECT", ignoreCase = true)
+                if (loopish) {
+                    handleRedirectLoop(view, request.url.toString())
                     return
                 }
 
-                // Cover the native error page IMMEDIATELY so the Android
-                // robot icon never leaks.
-                spinner.visibility = View.VISIBLE
+                // Any other main-frame error: try the last page that
+                // actually committed, then surrender to NoLink only if we
+                // never had one.
+                val restoreTo = if (pageReady) lastMainFrameUrl else null
+                if (restoreTo != null) {
+                    retryPending = true
+                    view?.postDelayed({
+                        if (!isFinishing && !isDestroyed) {
+                            runCatching {
+                                view.stopLoading()
+                                view.loadUrl(restoreTo)
+                            }
+                        }
+                    }, RELOAD_GRACE_MS)
+                    return
+                }
 
-                val isConn = desc.contains("name_not_resolved") ||
-                    desc.contains("address_unreachable") ||
-                    desc.contains("internet_disconnected") ||
-                    desc.contains("network_changed") ||
-                    code == ERROR_HOST_LOOKUP ||
-                    code == ERROR_CONNECT ||
-                    code == ERROR_TIMEOUT ||
-                    code == ERROR_UNKNOWN
-
-                if (isConn) forwardToOffline() else guardOffline()
+                runCatching {
+                    view?.stopLoading()
+                    view?.loadUrl(BLANK)
+                }
+                forwardToOffline()
             }
 
             override fun onReceivedSslError(
@@ -229,6 +450,20 @@ class WebCanvasActivity : AppCompatActivity() {
         w.webChromeClient = object : WebChromeClient() {
             override fun onPermissionRequest(request: PermissionRequest?) {
                 request?.grant(request.resources)
+            }
+
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                // Backstop for a page that reports progress but never a
+                // finished load. `about:blank` is only ever loaded on the
+                // way out to the offline screen, so its 100% says nothing
+                // about the page the user is actually waiting for.
+                val url = view?.url
+                if (newProgress < 100 || url == null || url == BLANK) return
+                if (hasErroredThisLoad) return
+                pageReady = true
+                chainSettled = true
+                lastMainFrameUrl = url
+                hideCover()
             }
 
             override fun onShowFileChooser(
@@ -250,6 +485,67 @@ class WebCanvasActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * Puts the black-and-spinner cover back over the WebView. Idempotent —
+     * repeated calls just keep the existing surface up and re-arm the
+     * safety timeout so a page that never reports back cannot hold the
+     * screen for good.
+     */
+    private fun showCover() {
+        cover.visibility = View.VISIBLE
+        cover.bringToFront()
+        handler.removeCallbacks(coverTimeout)
+        handler.postDelayed(coverTimeout, COVER_MAX_MS)
+    }
+
+    private fun hideCover() {
+        handler.removeCallbacks(coverTimeout)
+        cover.visibility = View.GONE
+    }
+
+    /**
+     * `ERR_TOO_MANY_REDIRECTS`. Chromium gives up after 20 hops; affiliate
+     * chains routinely need more. Reloading from [farthestHop] resumes
+     * the chain instead of walking it from scratch, so cookies picked up
+     * along the way stay in force. The reload is posted rather than
+     * called directly — the engine is still unwinding the failed
+     * navigation and swallows or defers a re-entrant `loadUrl`.
+     */
+    private fun handleRedirectLoop(view: WebView?, failedUrl: String) {
+        val engine = view ?: return
+        if (redirectRetries < REDIRECT_LOOP_BUDGET) {
+            redirectRetries++
+            retryPending = true
+            val resumeAt = farthestHop ?: failedUrl
+            engine.postDelayed({
+                if (!isFinishing && !isDestroyed) {
+                    runCatching { engine.loadUrl(resumeAt) }
+                }
+            }, RELOAD_GRACE_MS)
+            return
+        }
+        val entryUrl = intent.getStringExtra(EXTRA_URL)
+        if (!entryPointRetried && !entryUrl.isNullOrBlank() && entryUrl != farthestHop) {
+            entryPointRetried = true
+            retryPending = true
+            engine.postDelayed({
+                if (!isFinishing && !isDestroyed) {
+                    runCatching { engine.loadUrl(entryUrl) }
+                }
+            }, RELOAD_GRACE_MS)
+            return
+        }
+        retryPending = false
+        // Budget spent AND the entry URL was tried — fall through to the
+        // offline screen; without this the user would sit under the black
+        // cover forever.
+        runCatching {
+            engine.stopLoading()
+            engine.loadUrl(BLANK)
+        }
+        forwardToOffline()
     }
 
     private fun openExternal(uri: Uri) {
@@ -312,10 +608,19 @@ class WebCanvasActivity : AppCompatActivity() {
         Ui.immersive(this)
     }
 
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // A rotation recomputes bar heights AND the keyboard rest height —
+        // let the slider re-measure both, otherwise the first field tap
+        // after rotating lifts by the previous orientation's offset.
+        if (::kbd.isInitialized) kbd.reorient()
+    }
+
     override fun onDestroy() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         carrierWatcher?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
         handler.removeCallbacks(dropDebounce)
+        handler.removeCallbacks(coverTimeout)
         pendingFileCallback?.onReceiveValue(emptyArray())
         pendingFileCallback = null
         web.stopLoading()
@@ -326,14 +631,34 @@ class WebCanvasActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_URL = "bj_web_url"
 
+        private const val BLANK = "about:blank"
+
         // WebViewClient error-code constants — mirror them here so we can
         // rebuild without the transient ERROR_* imports that older API
         // levels omit.
-        private const val ERROR_HOST_LOOKUP = -2
-        private const val ERROR_CONNECT = -6
-        private const val ERROR_TIMEOUT = -8
         private const val ERROR_REDIRECT_LOOP = -9
-        private const val ERROR_UNKNOWN = -1
+
+        // How many times a chain may be resumed from [farthestHop] before
+        // we fall back to the entry URL. Each resume buys another 20-hop
+        // budget from Chromium, so two resumes cover the deepest affiliate
+        // chains we have seen without ever letting the loop spin forever.
+        private const val REDIRECT_LOOP_BUDGET = 2
+
+        // Grace before the queued reload actually fires. Long enough for
+        // Chromium to finish unwinding the failed navigation, short
+        // enough to feel instant.
+        private const val RELOAD_GRACE_MS = 60L
+
+        // No page may hold the cover for longer than this, finished or
+        // not — otherwise a hosted surface that reports progress and then
+        // silently stalls would leave the user under a black overlay for
+        // good.
+        private const val COVER_MAX_MS = 20_000L
+
+        // Spinner tint on the cover. Warm gold matches the loading art
+        // that immediately precedes this Activity, so the two screens
+        // look like one continuous frame.
+        private val COVER_ACCENT = Color.parseColor("#FFE0A344")
 
         fun start(context: Context, url: String) {
             val i = Intent(context, WebCanvasActivity::class.java).apply {

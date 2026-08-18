@@ -26,8 +26,8 @@ internal object LinkConfig {
     const val KEY_PREFIX = "z7q_"
 
     // ── Timings (all off-round; keep well outside sibling-app defaults) ──
-    /** Snooze after the user taps Skip on the opt-in stage. Days: ~3.6 */
-    const val OPT_IN_SNOOZE_SECONDS = 313_000L
+    /** Snooze after the user taps Skip on the opt-in stage. Exactly 3 days. */
+    const val OPT_IN_SNOOZE_SECONDS = 259_200L
     /** Delay before rescuing an af_status=Organic first callback. */
     const val ORGANIC_RESCUE_DELAY_MS = 6_400L
     /** POST timeout for the chart request. */

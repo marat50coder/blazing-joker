@@ -30,13 +30,16 @@ import com.blazingjoker.blazingjokergame.link.config.LinkConfig
  * routings, then snoozed for [LinkConfig.OPT_IN_SNOOZE_SECONDS] on Skip
  * or on OS denial.
  *
- * The Accept and Skip buttons are BOTH real filled pills — deliberately
- * NOT a text link with 85% opacity (see the pitfalls doc §12). Visual
- * weight comes from color/size, never from opacity.
+ * Landscape composition uses 30% side insets (so buttons take ~40% of
+ * screen width) and 25% smaller height/text so the pair of buttons fits
+ * comfortably against the horizontal artwork.
  */
 class AlertOptInActivity : AppCompatActivity() {
 
     private lateinit var bg: ImageView
+    private lateinit var controls: LinearLayout
+    private lateinit var acceptBtn: TextView
+    private lateinit var skipBtn: TextView
 
     private val permissionAsk = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -82,21 +85,12 @@ class AlertOptInActivity : AppCompatActivity() {
         }
         root.addView(scrim)
 
-        val controls = LinearLayout(this).apply {
+        controls = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            val lp = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            )
-            lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            lp.bottomMargin = 44.dp
-            lp.leftMargin = 32.dp
-            lp.rightMargin = 32.dp
-            layoutParams = lp
         }
 
-        val accept = filledButton(
+        acceptBtn = filledButton(
             label = getString(R.string.alert_optin_accept),
             fillColors = intArrayOf(
                 Color.parseColor("#FFF97316"),
@@ -105,14 +99,9 @@ class AlertOptInActivity : AppCompatActivity() {
             strokeColor = Color.parseColor("#66FFFFFF"),
             textColor = Color.WHITE,
         ) { onAccept() }
-        controls.addView(
-            accept,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 56.dp
-            ).apply { bottomMargin = 14.dp }
-        )
+        controls.addView(acceptBtn)
 
-        val skip = filledButton(
+        skipBtn = filledButton(
             label = getString(R.string.alert_optin_skip),
             fillColors = intArrayOf(
                 Color.parseColor("#331A0B24"),
@@ -121,29 +110,61 @@ class AlertOptInActivity : AppCompatActivity() {
             strokeColor = Color.parseColor("#66FFFFFF"),
             textColor = Color.WHITE,
         ) { onSkip() }
-        controls.addView(
-            skip,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 48.dp
-            )
-        )
+        controls.addView(skipBtn)
 
         root.addView(controls)
         setContentView(root)
-        applyOrientationBackground(resources.configuration)
+        applyOrientation(resources.configuration)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        applyOrientationBackground(newConfig)
+        applyOrientation(newConfig)
     }
 
-    private fun applyOrientationBackground(config: Configuration) {
+    /**
+     * Re-lays the two pill buttons and swaps the background art. Portrait
+     * keeps the original wide pills; landscape uses 30% side insets and a
+     * 25% smaller height/text so the buttons don't overpower the art.
+     */
+    private fun applyOrientation(config: Configuration) {
+        val isLandscape = config.orientation == Configuration.ORIENTATION_LANDSCAPE
         bg.setImageResource(
-            if (config.orientation == Configuration.ORIENTATION_LANDSCAPE)
-                R.drawable.opt_in_horizontal
-            else R.drawable.opt_in_vertical
+            if (isLandscape) R.drawable.opt_in_horizontal else R.drawable.opt_in_vertical
         )
+
+        val screenW = resources.displayMetrics.widthPixels
+        val sideInsetPx = if (isLandscape) (screenW * 0.30f).toInt() else 32.dp
+        val bottomInsetPx = if (isLandscape) 24.dp else 44.dp
+
+        val panelLp = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            leftMargin = sideInsetPx
+            rightMargin = sideInsetPx
+            bottomMargin = bottomInsetPx
+        }
+        controls.layoutParams = panelLp
+
+        val acceptH = if (isLandscape) 42.dp else 56.dp
+        val skipH = if (isLandscape) 36.dp else 48.dp
+        val gap = if (isLandscape) 10.dp else 14.dp
+        val cornerR = if (isLandscape) 16.5f.dp else 22f.dp
+        val textPx = if (isLandscape) 12.75f else 17f
+
+        acceptBtn.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, acceptH
+        ).apply { bottomMargin = gap }
+        acceptBtn.textSize = textPx
+        (acceptBtn.background as? GradientDrawable)?.cornerRadius = cornerR
+
+        skipBtn.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, skipH
+        )
+        skipBtn.textSize = textPx
+        (skipBtn.background as? GradientDrawable)?.cornerRadius = cornerR
     }
 
     private fun onAccept() {

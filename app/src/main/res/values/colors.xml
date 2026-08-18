@@ -14,7 +14,11 @@
     <color name="track">#66000000</color>
 
     <!-- Gray flow -->
-    <color name="link_horn_accent">#FFE86A19</color>
+    <!-- Tint applied to the notification small icon in the expanded tray
+         entry (next to the app name). White matches the platform's own
+         tray glyph colour and keeps the flame silhouette from reading as
+         a coloured badge. -->
+    <color name="link_horn_accent">#FFFFFFFF</color>
     <!-- Launch background matches the icon's dark corners -->
     <color name="link_launch_bg">#FF120616</color>
 </resources>

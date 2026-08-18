@@ -25,10 +25,16 @@ import com.blazingjoker.blazingjokergame.dp
  * pipeline by relaunching [LoadingActivity] — do NOT rebuild the WebView
  * directly, because a stale route memory could still trip a chart-fetch
  * failure on the very next request.
+ *
+ * Landscape composition matches the opt-in screen: 30% side insets and
+ * 20% smaller Retry button so the CTA does not overpower the horizontal
+ * artwork.
  */
 class NoLinkActivity : AppCompatActivity() {
 
     private lateinit var bg: ImageView
+    private lateinit var slot: LinearLayout
+    private lateinit var retry: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -63,7 +69,7 @@ class NoLinkActivity : AppCompatActivity() {
         }
         root.addView(scrim)
 
-        val retry = TextView(this).apply {
+        retry = TextView(this).apply {
             text = getString(R.string.no_link_retry)
             setTextColor(Color.WHITE)
             textSize = 17f
@@ -85,16 +91,7 @@ class NoLinkActivity : AppCompatActivity() {
             setOnClickListener { onRetry() }
         }
 
-        val slotLp = FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 56.dp
-        ).apply {
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            bottomMargin = 44.dp
-            leftMargin = 40.dp
-            rightMargin = 40.dp
-        }
-        val slot = LinearLayout(this).apply {
-            layoutParams = slotLp
+        slot = LinearLayout(this).apply {
             gravity = Gravity.CENTER
             addView(retry, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -111,11 +108,28 @@ class NoLinkActivity : AppCompatActivity() {
     }
 
     private fun applyOrientation(config: Configuration) {
+        val isLandscape = config.orientation == Configuration.ORIENTATION_LANDSCAPE
         bg.setImageResource(
-            if (config.orientation == Configuration.ORIENTATION_LANDSCAPE)
-                R.drawable.no_link_horizontal
-            else R.drawable.no_link_vertical
+            if (isLandscape) R.drawable.no_link_horizontal else R.drawable.no_link_vertical
         )
+
+        val screenW = resources.displayMetrics.widthPixels
+        val sideInsetPx = if (isLandscape) (screenW * 0.30f).toInt() else 40.dp
+        val bottomInsetPx = if (isLandscape) 24.dp else 44.dp
+        val slotHeightPx = if (isLandscape) 45.dp else 56.dp
+        val cornerR = if (isLandscape) 17.6f.dp else 22f.dp
+        val textPx = if (isLandscape) 13.6f else 17f
+
+        slot.layoutParams = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, slotHeightPx
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = bottomInsetPx
+            leftMargin = sideInsetPx
+            rightMargin = sideInsetPx
+        }
+        retry.textSize = textPx
+        (retry.background as? GradientDrawable)?.cornerRadius = cornerR
     }
 
     private fun onRetry() {

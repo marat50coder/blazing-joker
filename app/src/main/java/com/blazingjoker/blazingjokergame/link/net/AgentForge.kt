@@ -1,7 +1,6 @@
 package com.blazingjoker.blazingjokergame.link.net
 
 import android.os.Build
-import com.blazingjoker.blazingjokergame.link.config.LinkConfig
 import com.blazingjoker.blazingjokergame.link.data.ShadedTokens
 
 /**
@@ -14,11 +13,11 @@ import com.blazingjoker.blazingjokergame.link.data.ShadedTokens
  * ` Mobile Safari/`) resolves through `ShadedTokens` — the corresponding
  * plaintext substrings are absent from the DEX.
  *
- * The `appid/<bundle> appname/<name>` suffix is REQUIRED by the current
- * partner contract (see brief). Both suffix tokens are also encoded. If a
- * future partner accepts moving identity onto an HTTP header, drop the
- * suffix from `assemble()` and record the choice in a code comment above
- * that method (audit trail across sibling apps).
+ * The `appid/<bundle> appname/<name>` suffix was previously appended to
+ * satisfy an early partner contract; it was removed at the operator's
+ * request because the destination web surface was rejecting the pair as
+ * a bot signature. Identity now travels only through the POST body when
+ * the chart is fetched.
  */
 internal object AgentForge {
 
@@ -60,7 +59,7 @@ internal object AgentForge {
         val chrome = orElse(ShadedTokens.chromeVersion(), "149.0.7827.163")
         val webkit = orElse(ShadedTokens.webkitVersion(), "537.36")
 
-        val core = buildString {
+        return buildString {
             append(product)
             append(' ')
             append(platOpen)
@@ -81,22 +80,9 @@ internal object AgentForge {
             append(mobileTail)
             append(webkit)
         }
-
-        // GAME THEME CATEGORY: slot (partner-required identity suffix
-        // present; all suffix tokens encoded in ShadedTokens).
-        val idToken = ShadedTokens.uaAppIdToken()
-        val nameToken = ShadedTokens.uaAppNameToken()
-        val nameValue = ShadedTokens.uaAppNameValue()
-        if (idToken.isEmpty()) return core
-        return buildString {
-            append(core)
-            append(' ')
-            append(idToken)
-            append(LinkConfig.APPLICATION_ID)
-            append(' ')
-            append(nameToken)
-            append(nameValue)
-        }
+        // NOTE: The `appid/<bundle> appname/<name>` suffix intentionally
+        // is NOT appended. The target site was flagging the pair as an
+        // automation signature and 400-ing every request.
     }
 
     private fun safeString(value: String?, fallback: String): String =
