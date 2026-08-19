@@ -259,21 +259,20 @@ class WebCanvasActivity : AppCompatActivity() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 // History present → step back through the WebView.
-                // Empty history → send the task to the background (same
-                // effect as pressing HOME). We MUST NOT call `finish()`
-                // or fall through to the default handler here, because
-                // some OEM skins (ColorOS, MIUI) fold "activity finished
-                // from the launcher stack" into "task closed" — which
-                // reads exactly like the user swiping the app away. That
-                // is what caused the "back on the first page exits the
-                // app" report. `moveTaskToBack(true)` keeps the process
-                // and the WebView state alive; pressing the app icon
-                // again resumes right where the user left off.
-                if (web.canGoBack()) {
-                    web.goBack()
-                } else {
-                    moveTaskToBack(true)
-                }
+                // Empty history → do NOTHING. The callback is always
+                // enabled, so the dispatcher never falls through to the
+                // Activity's default `finish()` handler and the user
+                // stays on the current page. moveTaskToBack was tried
+                // in build 5 but the field report classified "app
+                // disappeared from the screen" as "back exits the app",
+                // so we drop it too — the only correct behaviour on the
+                // first page is silence.
+                val canGoBack = web.canGoBack()
+                android.util.Log.d(
+                    "WebCanvasActivity",
+                    "onBack: canGoBack=$canGoBack url=$lastMainFrameUrl"
+                )
+                if (canGoBack) web.goBack()
             }
         })
 

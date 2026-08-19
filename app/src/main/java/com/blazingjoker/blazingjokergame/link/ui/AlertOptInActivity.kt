@@ -23,12 +23,15 @@ import com.blazingjoker.blazingjokergame.R
 import com.blazingjoker.blazingjokergame.Ui
 import com.blazingjoker.blazingjokergame.dp
 import com.blazingjoker.blazingjokergame.link.LinkPilot
-import com.blazingjoker.blazingjokergame.link.config.LinkConfig
 
 /**
  * Push opt-in promo. Shown once before the WebCanvas on FRESH gray-flow
- * routings, then snoozed for [LinkConfig.OPT_IN_SNOOZE_SECONDS] on Skip
- * or on OS denial.
+ * routings. Any user action — Accept, Skip, or an OS "Don't allow" —
+ * is treated as a final decision and prevents the screen from ever
+ * reappearing. A user who changes their mind can flip notifications on
+ * again through the system settings switch;
+ * [StowageBox.shouldInvitePermission] reconciles that back into our
+ * internal flag on the next launch.
  *
  * Landscape composition uses 30% side insets (so buttons take ~40% of
  * screen width) and 25% smaller height/text so the pair of buttons fits
@@ -200,7 +203,14 @@ class AlertOptInActivity : AppCompatActivity() {
     }
 
     private fun onSkip() {
-        LinkPilot.of(this).stowage.snoozeOptIn(LinkConfig.OPT_IN_SNOOZE_SECONDS)
+        // Skip is the user's explicit refusal to opt in — treat it the
+        // same as an OS-level "Don't allow". The soft-snooze model
+        // (screen came back every OPT_IN_SNOOZE_SECONDS) mapped onto
+        // the "notif prompt keeps appearing" field report. The only
+        // supported way back to notifications is the system settings
+        // switch, which `shouldInvitePermission(activity)` reconciles
+        // via the OS-level permission check.
+        LinkPilot.of(this).stowage.markOptInHardBlocked()
         forward()
     }
 
