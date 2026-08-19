@@ -47,7 +47,26 @@ class AlertOptInActivity : AppCompatActivity() {
         val pilot = LinkPilot.of(this)
         pilot.stowage.markOptInGranted(granted)
         if (!granted) {
-            pilot.stowage.snoozeOptIn(LinkConfig.OPT_IN_SNOOZE_SECONDS)
+            // Android 13+ auto-hard-denies POST_NOTIFICATIONS after the
+            // first "Don't allow" — the second launch calls
+            // `requestPermissionLauncher.launch()` and the system fires the
+            // callback IMMEDIATELY with `granted=false` without ever
+            // showing UI. If we treat that identically to a fresh skip we
+            // just snooze another 3 days and the notif screen keeps
+            // reappearing on every launch cycle forever (pitfall #17).
+            //
+            // `shouldShowRequestPermissionRationale` returning false AFTER
+            // a denial callback is the OS-standard signal for "user has
+            // permanently refused; do not ask again". Latch a hard block
+            // so `shouldInvitePermission` returns false from now on.
+            val hardBlocked =
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    !shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)
+            if (hardBlocked) {
+                pilot.stowage.markOptInHardBlocked()
+            } else {
+                pilot.stowage.snoozeOptIn(LinkConfig.OPT_IN_SNOOZE_SECONDS)
+            }
         }
         forward()
     }
@@ -176,6 +195,12 @@ class AlertOptInActivity : AppCompatActivity() {
                 LinkPilot.of(this).stowage.markOptInGranted(true)
                 forward()
             } else {
+                // Latch "we did ask" BEFORE firing — without this the OS
+                // "permanent refusal" state is indistinguishable from
+                // "never asked" and `shouldShowRequestPermissionRationale`
+                // would let the screen come back forever after one hard
+                // deny.
+                LinkPilot.of(this).stowage.wasNotificationAsked = true
                 permissionAsk.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         } else {

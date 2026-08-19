@@ -19,6 +19,8 @@ import com.blazingjoker.blazingjokergame.LoadingActivity
 import com.blazingjoker.blazingjokergame.R
 import com.blazingjoker.blazingjokergame.Ui
 import com.blazingjoker.blazingjokergame.dp
+import com.blazingjoker.blazingjokergame.link.LinkPilot
+import com.blazingjoker.blazingjokergame.link.data.LastCourse
 
 /**
  * No-connection screen for the gray flow. Retry rebuilds the full boot
@@ -133,10 +135,26 @@ class NoLinkActivity : AppCompatActivity() {
     }
 
     private fun onRetry() {
-        val boot = Intent(this, LoadingActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        // Prefer resuming the exact URL the user was on when the link
+        // dropped — that's what `WebCanvasActivity.forwardToOffline`
+        // stashes for us. Going through the full boot pipeline instead
+        // would re-run attribution + chart POST, land on the top of the
+        // configured entry URL, and drop whatever session the user had.
+        // Sibling shells (foollegends OfflinePortal.tryRetry) do this
+        // exact hand-off.
+        val returnUrl = intent.getStringExtra(EXTRA_RETRY_URL).orEmpty()
+        val stowage = LinkPilot.of(this).stowage
+        val resumeUrl = returnUrl.ifEmpty { stowage.cachedDestination().orEmpty() }
+
+        val next: Intent = if (resumeUrl.isNotEmpty() && stowage.course == LastCourse.Web) {
+            Intent(this, WebCanvasActivity::class.java).apply {
+                putExtra(WebCanvasActivity.EXTRA_URL, resumeUrl)
+            }
+        } else {
+            Intent(this, LoadingActivity::class.java)
         }
-        startActivity(boot)
+        next.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        startActivity(next)
         finish()
     }
 

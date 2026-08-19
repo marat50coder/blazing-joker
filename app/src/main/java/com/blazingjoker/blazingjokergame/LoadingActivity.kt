@@ -19,8 +19,11 @@ import android.util.Log
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.blazingjoker.blazingjokergame.link.LinkPilot
+import com.blazingjoker.blazingjokergame.link.config.LinkConfig
 import com.blazingjoker.blazingjokergame.link.data.Berth
+import com.blazingjoker.blazingjokergame.link.data.LastCourse
 import com.blazingjoker.blazingjokergame.link.push.HornFcmService
+import com.blazingjoker.blazingjokergame.link.push.PushBus
 import com.blazingjoker.blazingjokergame.link.ui.AlertOptInActivity
 import com.blazingjoker.blazingjokergame.link.ui.NoLinkActivity
 import com.blazingjoker.blazingjokergame.link.ui.WebCanvasActivity
@@ -104,11 +107,65 @@ class LoadingActivity : AppCompatActivity() {
         val coldUrl = extractPushUrl(intent)
         if (coldUrl.isNotEmpty()) {
             Log.d(TAG, "cold-tap URL from launch intent: $coldUrl")
+
+            // Warm hand-off: if the WebView shell is already on screen,
+            // load the URL there directly instead of relaunching the
+            // whole pilot. This is what turns a "loading → new page"
+            // flash into a normal in-page navigation for pushes tapped
+            // while the app is foregrounded (foollegends WelcomePortal
+            // does the exact same thing).
+            if (PushBus.shellAlive && PushBus.handOver(coldUrl)) {
+                Log.d(TAG, "warm push handed to the live shell")
+                finish()
+                overridePendingTransition(0, 0)
+                return
+            }
+
             pilot.stowage.stashPendingUrl(coldUrl)
+        }
+
+        // Fast path: no carrier at all. Showing the splash + progress bar
+        // for a decision that literally cannot be made (attribution needs
+        // the network, cache needs a URL to hand back) just adds a
+        // gratuitous "loading → error" flash. Sibling shells (foollegends
+        // WelcomePortal) do the same — offline first frame, no splash.
+        if (LinkConfig.credentialsReady &&
+            coldUrl.isEmpty() &&
+            !pilot.auditor.hasCarrier()
+        ) {
+            skipToOfflineBerth(pilot)
+            return
         }
 
         buildScreen()
         pilot.kickOffAmbient()
+    }
+
+    /**
+     * No carrier + credentials plumbed in → dispatch immediately based on
+     * last-known course. Never blocks on I/O and never runs the pilot.
+     *   Native → game (fully offline-capable)
+     *   Web    → offline retry screen with the last URL for a resume load
+     *   Unset  → offline retry screen; a first-online launch runs the
+     *            full pilot from scratch
+     */
+    private fun skipToOfflineBerth(pilot: LinkPilot) {
+        Log.d(TAG, "skipToOfflineBerth course=${pilot.stowage.course}")
+        val next: Intent = when (pilot.stowage.course) {
+            LastCourse.Native -> Intent(this, MainMenuActivity::class.java)
+            LastCourse.Web, LastCourse.Unset -> {
+                val cached = pilot.stowage.cachedDestination().orEmpty()
+                Intent(this, NoLinkActivity::class.java).apply {
+                    if (cached.isNotEmpty()) {
+                        putExtra(NoLinkActivity.EXTRA_RETRY_URL, cached)
+                    }
+                }
+            }
+        }
+        next.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        startActivity(next)
+        overridePendingTransition(0, 0)
+        finish()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -119,9 +176,19 @@ class LoadingActivity : AppCompatActivity() {
         val coldUrl = extractPushUrl(intent)
         if (coldUrl.isNotEmpty()) {
             Log.d(TAG, "cold-tap URL from onNewIntent: $coldUrl")
+
+            // Warm hand-off wins over restarting the pilot: if a live
+            // WebCanvas shell is still subscribed, deliver the URL to it
+            // and close this LoadingActivity re-entry silently.
+            if (PushBus.shellAlive && PushBus.handOver(coldUrl)) {
+                Log.d(TAG, "warm push (onNewIntent) handed to the live shell")
+                finish()
+                return
+            }
+
             // Push tapped while LoadingActivity is still on screen (rare —
-            // usually CLEAR_TASK from the pending intent wipes the whole
-            // stack first). Stash the URL and RESTART the pilot so the
+            // usually CLEAR_TOP from the pending intent brings the shell
+            // forward first). Stash the URL and RESTART the pilot so the
             // dispatcher gets a chance to route into WebCanvas with the
             // fresh URL. Without the restart the pilot job just holds the
             // previous verdict and the tap does nothing visible.
@@ -212,6 +279,11 @@ class LoadingActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         Ui.immersive(this)
+        // The fast path in onCreate finishes without building the screen,
+        // so the lateinit UI vars are empty. Guard everything that touches
+        // them and skip the pilot — it's already off to another Activity.
+        if (isFinishing || !::progressBar.isInitialized) return
+
         uiHandler.post(dotRunnable)
 
         // Send the AppsFlyer launch event with a REAL Activity host. Passing
@@ -348,10 +420,19 @@ class LoadingActivity : AppCompatActivity() {
     private fun dispatch(berth: Berth) {
         val pilot = LinkPilot.of(this)
         val next: Intent = when (berth) {
-            is Berth.Native -> Intent(this, MainMenuActivity::class.java)
+            is Berth.Native -> {
+                Log.d(TAG, "dispatch → Native (MainMenu)")
+                Intent(this, MainMenuActivity::class.java)
+            }
 
             is Berth.Web -> {
-                if (!berth.fromColdPush && pilot.stowage.shouldInvitePermission) {
+                val inviteWanted = pilot.stowage.shouldInvitePermission(this)
+                Log.d(
+                    TAG,
+                    "dispatch → Web url=${berth.url} fromColdPush=${berth.fromColdPush} " +
+                        "inviteWanted=$inviteWanted"
+                )
+                if (!berth.fromColdPush && inviteWanted) {
                     Intent(this, AlertOptInActivity::class.java).apply {
                         putExtra(AlertOptInActivity.EXTRA_DESTINATION_URL, berth.url)
                     }
@@ -362,7 +443,10 @@ class LoadingActivity : AppCompatActivity() {
                 }
             }
 
-            is Berth.LostSignal -> Intent(this, NoLinkActivity::class.java)
+            is Berth.LostSignal -> {
+                Log.d(TAG, "dispatch → LostSignal (NoLink)")
+                Intent(this, NoLinkActivity::class.java)
+            }
         }
         next.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         startActivity(next)

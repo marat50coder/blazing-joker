@@ -1,7 +1,14 @@
 package com.blazingjoker.blazingjokergame.link.store
 
+import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.os.Build
+import android.util.Log
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.blazingjoker.blazingjokergame.link.config.LinkConfig
@@ -65,6 +72,7 @@ internal class StowageBox(context: Context) {
     private val kOptInSnooze = "${LinkConfig.KEY_PREFIX}opt_until"
     private val kOptInGranted = "${LinkConfig.KEY_PREFIX}opt_ok"
     private val kOptInHardBlock = "${LinkConfig.KEY_PREFIX}opt_hard_no"
+    private val kOptInOsAsked = "${LinkConfig.KEY_PREFIX}opt_os_asked"
     private val kPendingUrl = "${LinkConfig.KEY_PREFIX}pending"
 
     // ── Last course ────────────────────────────────────────────────
@@ -109,17 +117,115 @@ internal class StowageBox(context: Context) {
     /**
      * Should we show the opt-in promo before the WebView?
      *
-     * Never re-ask after a hard OS denial (Android 13+ suppresses the
-     * dialog permanently after one "no"). Never re-ask after a grant.
-     * Otherwise gated on the snooze timestamp.
+     * A silent close of the promo (task swipe, home, no button tap) MUST
+     * leave every flag untouched so the next launch shows the screen
+     * again — user hasn't chosen yet.
+     *
+     * This overload is kept for callers that cannot supply an Activity
+     * (e.g. background work). Prefer the Activity-aware version below —
+     * it also reconciles the internal flags with the OS-level permission
+     * state and with the system notification switch, so the screen never
+     * reappears after the user has already granted (or system-disabled)
+     * notifications outside our own UI.
      */
     val shouldInvitePermission: Boolean
         get() {
-            if (optInGranted) return false
-            if (optInHardBlocked) return false
+            val granted = optInGranted
+            val hard = optInHardBlocked
             val until = flat.getLong(kOptInSnooze, 0L)
-            return nowSeconds() >= until
+            val now = nowSeconds()
+            val decision = when {
+                granted -> false
+                hard -> false
+                else -> now >= until
+            }
+            Log.d(
+                TAG,
+                "shouldInvitePermission=$decision (granted=$granted, hardBlocked=$hard, " +
+                    "snoozeUntil=$until, now=$now, remaining=${until - now}s)"
+            )
+            return decision
         }
+
+    /**
+     * Activity-aware form. Uses the OS state as the source of truth for
+     * "already granted" and "hard-blocked", so a user who granted the
+     * permission through system settings (or via Play install-time
+     * prompt on API 33+) never sees our screen again — and, conversely,
+     * a user who has NOT explicitly acted through our UI keeps seeing it
+     * on every cold launch.
+     *
+     * This is intentionally the ONLY place that mutates the two "done"
+     * flags on OS observation. No lifecycle callback that runs without
+     * the user pressing Accept or Skip may write to them.
+     */
+    fun shouldInvitePermission(activity: Activity): Boolean {
+        if (optInGranted) {
+            Log.d(TAG, "shouldInvitePermission(activity)=false — internal granted")
+            return false
+        }
+        if (optInHardBlocked) {
+            Log.d(TAG, "shouldInvitePermission(activity)=false — internal hardBlocked")
+            return false
+        }
+        if (osNotificationsGranted(activity)) {
+            Log.d(TAG, "shouldInvitePermission(activity)=false — OS-granted, syncing")
+            flat.edit().putBoolean(kOptInGranted, true).apply()
+            return false
+        }
+        if (osNotificationsHardBlocked(activity)) {
+            Log.d(TAG, "shouldInvitePermission(activity)=false — OS hard-blocked, syncing")
+            flat.edit().putBoolean(kOptInHardBlock, true).apply()
+            return false
+        }
+        val until = flat.getLong(kOptInSnooze, 0L)
+        val now = nowSeconds()
+        val decision = now >= until
+        Log.d(
+            TAG,
+            "shouldInvitePermission(activity)=$decision (snoozeUntil=$until, now=$now, " +
+                "remaining=${until - now}s)"
+        )
+        return decision
+    }
+
+    /** On API 33+ the runtime permission is the authoritative signal. */
+    private fun osNotificationsGranted(activity: Activity): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                activity, Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * On API 33+ "permanent refusal" reads exactly like "never asked":
+     * both return DENIED and `shouldShowRequestPermissionRationale`
+     * false. The only reliable separator is a per-app "we did ask at
+     * least once" latch — [wasNotificationAsked] — which is only set
+     * from the RequestPermission callback (i.e. after a REAL OS dialog).
+     *
+     * Below API 33 there is no runtime permission; a disabled system
+     * switch is the OS "no" signal.
+     */
+    private fun osNotificationsHardBlocked(activity: Activity): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            wasNotificationAsked &&
+                !activity.shouldShowRequestPermissionRationale(
+                    Manifest.permission.POST_NOTIFICATIONS,
+                )
+        } else {
+            !NotificationManagerCompat.from(activity).areNotificationsEnabled()
+        }
+    }
+
+    /**
+     * True once the OS permission dialog has actually been requested by
+     * us at least once. Skip taps never touch this — so a skip cannot
+     * fake a "permanent refusal" on subsequent launches.
+     */
+    var wasNotificationAsked: Boolean
+        get() = flat.getBoolean(kOptInOsAsked, false)
+        set(v) = flat.edit().putBoolean(kOptInOsAsked, v).apply()
 
     // ── Cold-tap pending URL (secure, one-shot) ───────────────────
     fun stashPendingUrl(url: String?) {
@@ -135,4 +241,8 @@ internal class StowageBox(context: Context) {
     }
 
     private fun nowSeconds(): Long = System.currentTimeMillis() / 1000L
+
+    companion object {
+        private const val TAG = "StowageBox"
+    }
 }

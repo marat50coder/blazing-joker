@@ -43,6 +43,7 @@ import com.blazingjoker.blazingjokergame.dp
 import com.blazingjoker.blazingjokergame.link.LinkPilot
 import com.blazingjoker.blazingjokergame.link.config.LinkConfig
 import com.blazingjoker.blazingjokergame.link.net.AgentForge
+import com.blazingjoker.blazingjokergame.link.push.PushBus
 
 /**
  * The WebView shell — the gray surface.
@@ -137,6 +138,7 @@ class WebCanvasActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        PushBus.shellAlive = true
 
         // Edge-to-edge so the WebView can extend under the status/nav
         // strips; the safe-area padding below re-establishes a bezel
@@ -608,6 +610,56 @@ class WebCanvasActivity : AppCompatActivity() {
         Ui.immersive(this)
     }
 
+    override fun onStart() {
+        super.onStart()
+        // Subscribe to warm push URLs so a tap while the shell is on
+        // screen loads the URL into the live WebView rather than
+        // triggering a full re-dispatch through LoadingActivity.
+        PushBus.onWarmUrl = { url ->
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) loadPushUrl(url)
+            }
+        }
+    }
+
+    override fun onStop() {
+        // A backgrounded shell must not eat URLs meant for the next
+        // foregrounded one. Cold-tap URLs will run through LoadingActivity
+        // instead when no live subscriber is present.
+        PushBus.onWarmUrl = null
+        super.onStop()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val url = intent.getStringExtra(EXTRA_URL)?.takeIf { it.isNotBlank() } ?: return
+        loadPushUrl(url)
+    }
+
+    /**
+     * Load a URL into the existing WebView (in-session push tap / warm
+     * hand-off). The chain has already settled by this point — the user
+     * is reading a page — so we drop the cover immediately after start
+     * rather than raising it, keeping the transition feel like a normal
+     * in-page navigation.
+     */
+    private fun loadPushUrl(url: String) {
+        if (!::web.isInitialized) return
+        chainSettled = true
+        offlineShown = false
+        hasErroredThisLoad = false
+        retryPending = false
+        // A brief cover while the load starts stops the WebView from
+        // painting the previous page's `about:blank` flash between
+        // stopLoading() and the new frame commit.
+        showCover()
+        runCatching {
+            web.stopLoading()
+            web.loadUrl(url)
+        }
+    }
+
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
         // A rotation recomputes bar heights AND the keyboard rest height —
@@ -617,6 +669,8 @@ class WebCanvasActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        PushBus.onWarmUrl = null
+        PushBus.shellAlive = false
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         carrierWatcher?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
         handler.removeCallbacks(dropDebounce)

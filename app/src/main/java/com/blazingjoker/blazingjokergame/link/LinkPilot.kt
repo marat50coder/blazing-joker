@@ -140,16 +140,37 @@ internal class LinkPilot private constructor(
         onProgress(pFirstAttribution)
 
         val answer = askChart(installBag)
-        Log.d(TAG, "decideFresh: verdict approved=${answer.approved} url=${answer.url} note=${answer.note}")
+        Log.d(TAG, "decideFresh: verdict approved=${answer.approved} url=${answer.url} note=${answer.note} serverResponded=${answer.serverResponded}")
         onProgress(pFirstVerdict)
 
-        return if (answer.hasDestination) {
+        if (answer.hasDestination) {
             stowage.course = LastCourse.Web
-            Berth.Web(answer.url!!, fromColdPush = false)
-        } else {
-            stowage.course = LastCourse.Native
-            Berth.Native
+            return Berth.Web(answer.url!!, fromColdPush = false)
         }
+
+        // A "no url" verdict only sticks (course = Native, no further
+        // attribution attempts on future launches) when the backend
+        // actually answered AND we had attribution to hand over. Any
+        // other outcome — DNS timeout, HTTP 5xx, malformed JSON, or the
+        // AppsFlyer callback never firing — is "we could not ask", not
+        // "we asked and the answer was no". Committing Native there is
+        // exactly what left OneLink installs that started offline stuck
+        // on the game after a single retry (foollegends WelcomePortal
+        // guards against this the same way).
+        val attributionCame = installBag.isNotEmpty() ||
+            campaign.uriFacts().isNotEmpty() ||
+            campaign.deepLinkFacts().isNotEmpty()
+        if (answer.serverResponded && attributionCame) {
+            stowage.course = LastCourse.Native
+        } else {
+            Log.i(
+                TAG,
+                "decideFresh: leaving course Unset " +
+                    "(serverResponded=${answer.serverResponded}, " +
+                    "attributionCame=$attributionCame) so the next launch retries"
+            )
+        }
+        return Berth.Native
     }
 
     private suspend fun decideReturningWeb(onProgress: (Float) -> Unit): Berth {
