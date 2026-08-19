@@ -259,15 +259,21 @@ class WebCanvasActivity : AppCompatActivity() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 // History present → step back through the WebView.
-                // Empty history → silently swallow the press. Calling
-                // `finish()` or `finishAffinity()` here would close the
-                // Activity, and the launcher callback in LoadingActivity
-                // would read that as a natural finish and re-run the boot
-                // pipeline from scratch (or worse, kill the whole app).
-                // Sibling shells (`foollegends/StreamPortal`,
-                // `magma-coins/StreamActivity`) also just consume the press;
-                // if the user wants to leave, HOME / recents does the job.
-                if (web.canGoBack()) web.goBack()
+                // Empty history → send the task to the background (same
+                // effect as pressing HOME). We MUST NOT call `finish()`
+                // or fall through to the default handler here, because
+                // some OEM skins (ColorOS, MIUI) fold "activity finished
+                // from the launcher stack" into "task closed" — which
+                // reads exactly like the user swiping the app away. That
+                // is what caused the "back on the first page exits the
+                // app" report. `moveTaskToBack(true)` keeps the process
+                // and the WebView state alive; pressing the app icon
+                // again resumes right where the user left off.
+                if (web.canGoBack()) {
+                    web.goBack()
+                } else {
+                    moveTaskToBack(true)
+                }
             }
         })
 

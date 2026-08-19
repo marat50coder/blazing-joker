@@ -124,11 +124,28 @@ class LoadingActivity : AppCompatActivity() {
             pilot.stowage.stashPendingUrl(coldUrl)
         }
 
-        // Fast path: no carrier at all. Showing the splash + progress bar
-        // for a decision that literally cannot be made (attribution needs
-        // the network, cache needs a URL to hand back) just adds a
-        // gratuitous "loading → error" flash. Sibling shells (foollegends
-        // WelcomePortal) do the same — offline first frame, no splash.
+        // Fast path #1: last-known course is Native. Once we have
+        // committed a user to the white-part game, every subsequent
+        // launch MUST reach the menu even fully offline — the native
+        // game itself has no network dependency, so making it wait on
+        // attribution + chart POST just to potentially discover a Web
+        // upgrade is what triggered the "second launch of the white
+        // part needs internet" report. Skip the pilot entirely.
+        if (LinkConfig.credentialsReady &&
+            coldUrl.isEmpty() &&
+            pilot.stowage.course == LastCourse.Native
+        ) {
+            Log.d(TAG, "fast-path: course=Native → MainMenu without pilot")
+            skipToOfflineBerth(pilot)
+            return
+        }
+
+        // Fast path #2: no carrier at all. Showing the splash + progress
+        // bar for a decision that literally cannot be made (attribution
+        // needs the network, cache needs a URL to hand back) just adds
+        // a gratuitous "loading → error" flash. Sibling shells
+        // (foollegends WelcomePortal) do the same — offline first frame,
+        // no splash.
         if (LinkConfig.credentialsReady &&
             coldUrl.isEmpty() &&
             !pilot.auditor.hasCarrier()
