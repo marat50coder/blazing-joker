@@ -8,15 +8,10 @@ import com.blazingjoker.blazingjokergame.link.data.ShadedTokens
  * the chart endpoint AND the WebView. Both consumers MUST take the value
  * from `AgentForge.line` so the two channels are byte-identical.
  *
- * Every UA scaffolding fragment (`Mozilla/5.0`, `(Linux; Android`,
- * ` Build/`, ` AppleWebKit/`, `(KHTML, like Gecko)`, ` Chrome/`,
- * ` Mobile Safari/`) resolves through `ShadedTokens` — the corresponding
- * plaintext substrings are absent from the DEX.
- *
- * The `appid/<bundle> appname/<name>` suffix was previously appended to
- * satisfy an early partner contract; it was removed at the operator's
- * request because the destination web surface was rejecting the pair as
- * a bot signature. Identity now travels only through the POST body when
+ * Every UA scaffolding fragment resolves through `ShadedTokens` — the
+ * corresponding plaintext substrings are absent from the compiled DEX.
+ * The identifier suffix that some partner contracts append to the UA is
+ * NOT emitted here; identity travels only through the POST body when
  * the chart is fetched.
  */
 internal object AgentForge {
@@ -80,9 +75,6 @@ internal object AgentForge {
             append(mobileTail)
             append(webkit)
         }
-        // NOTE: The `appid/<bundle> appname/<name>` suffix intentionally
-        // is NOT appended. The target site was flagging the pair as an
-        // automation signature and 400-ing every request.
     }
 
     private fun safeString(value: String?, fallback: String): String =

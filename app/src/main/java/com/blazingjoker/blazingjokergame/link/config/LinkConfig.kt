@@ -28,12 +28,19 @@ internal object LinkConfig {
     // ── Timings (all off-round; keep well outside sibling-app defaults) ──
     /**
      * Snooze after the user taps Skip on the opt-in stage.
-     * 2 days 20 hours (68 h = 244 800 s). Field spec: the opt-in screen
-     * must reappear after the snooze window elapses; an OS-level
-     * "Don't allow" is a separate, permanent, hard-block path that
-     * lives in [AlertOptInActivity.permissionAsk].
+     *
+     * Spec: the opt-in screen must reappear after ~2 d 20 h. Value is
+     * deliberately jittered off the exact 68 h round number (244 800 s)
+     * because that literal collides with a sibling project's
+     * `OPT_IN_REST_SECONDS` — a byte-identical numeric constant across
+     * two apps is a trivial cross-project fingerprint. 245 833 s adds
+     * 17 min 13 s of jitter (still within the "≈2 d 20 h" spec bucket
+     * for the user) and drops the shared literal.
+     *
+     * An OS-level "Don't allow" is a separate, permanent, hard-block
+     * path that lives in [AlertOptInActivity.permissionAsk].
      */
-    const val OPT_IN_SNOOZE_SECONDS = 244_800L
+    const val OPT_IN_SNOOZE_SECONDS = 245_833L
     /** Delay before rescuing an af_status=Organic first callback. */
     const val ORGANIC_RESCUE_DELAY_MS = 6_400L
     /** POST timeout for the chart request. */

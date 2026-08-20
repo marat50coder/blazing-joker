@@ -56,7 +56,7 @@ internal object LensInjector {
 
     private val keyboardBody = """
         (function(){
-          if (window.__bjKbNudge) return; window.__bjKbNudge = 1;
+          if (window.__bjImeAnchor) return; window.__bjImeAnchor = 1;
           try {
             var last = null;
             document.addEventListener('focusin', function(e){
