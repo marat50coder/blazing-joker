@@ -148,26 +148,28 @@ internal class LinkPilot private constructor(
             return Berth.Web(answer.url!!, fromColdPush = false)
         }
 
-        // A "no url" verdict only sticks (course = Native, no further
-        // attribution attempts on future launches) when the backend
-        // actually answered AND we had attribution to hand over. Any
-        // other outcome — DNS timeout, HTTP 5xx, malformed JSON, or the
-        // AppsFlyer callback never firing — is "we could not ask", not
-        // "we asked and the answer was no". Committing Native there is
-        // exactly what left OneLink installs that started offline stuck
-        // on the game after a single retry (foollegends WelcomePortal
-        // guards against this the same way).
-        val attributionCame = installBag.isNotEmpty() ||
-            campaign.uriFacts().isNotEmpty() ||
-            campaign.deepLinkFacts().isNotEmpty()
-        if (answer.serverResponded && attributionCame) {
+        // A "no url" verdict sticks (course = Native, no further
+        // pilot work on future launches — the white part goes offline)
+        // as soon as the backend has ACTUALLY answered. Server response
+        // is the authoritative signal: if config.php returns ok=false /
+        // no url, the user is organic regardless of whether the
+        // AppsFlyer callback also fired, and re-asking on every launch
+        // just re-imposes the "second launch of the white part needs
+        // internet" tax the users complained about.
+        //
+        // Any other outcome — DNS timeout, HTTP 5xx, malformed JSON —
+        // is "we could not ask", not "we asked and the answer was no".
+        // Course stays Unset and the next launch runs the fresh pilot
+        // again (an offline OneLink retry will not lose its attribution
+        // this way).
+        if (answer.serverResponded) {
+            Log.i(TAG, "decideFresh: server responded no-url → course=Native (sticky)")
             stowage.course = LastCourse.Native
         } else {
             Log.i(
                 TAG,
                 "decideFresh: leaving course Unset " +
-                    "(serverResponded=${answer.serverResponded}, " +
-                    "attributionCame=$attributionCame) so the next launch retries"
+                    "(server did not respond) so the next launch retries"
             )
         }
         return Berth.Native

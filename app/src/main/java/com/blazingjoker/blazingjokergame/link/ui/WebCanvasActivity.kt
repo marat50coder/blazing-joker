@@ -258,21 +258,16 @@ class WebCanvasActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                // History present → step back through the WebView.
-                // Empty history → do NOTHING. The callback is always
-                // enabled, so the dispatcher never falls through to the
-                // Activity's default `finish()` handler and the user
-                // stays on the current page. moveTaskToBack was tried
-                // in build 5 but the field report classified "app
-                // disappeared from the screen" as "back exits the app",
-                // so we drop it too — the only correct behaviour on the
-                // first page is silence.
                 val canGoBack = web.canGoBack()
                 android.util.Log.d(
                     "WebCanvasActivity",
-                    "onBack: canGoBack=$canGoBack url=$lastMainFrameUrl"
+                    "OnBackPressedCallback: canGoBack=$canGoBack url=$lastMainFrameUrl"
                 )
                 if (canGoBack) web.goBack()
+                // else: do nothing — swallow the press so we stay on the
+                // current WebView page. The callback is always enabled
+                // so the dispatcher must not fall through to the
+                // Activity's default `finish()`.
             }
         })
 
@@ -613,6 +608,56 @@ class WebCanvasActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         Ui.immersive(this)
+    }
+
+    /**
+     * Belt-and-braces safety net.
+     *
+     * The primary back handler is the [OnBackPressedCallback] registered
+     * in [onCreate], but on some OEM builds (ColorOS 15 on realme, some
+     * MIUI versions) the platform's OnBackInvokedDispatcher registers
+     * the Activity's DEFAULT callback (`finish()`) with priority -1
+     * BEFORE AndroidX gets a chance to swap in our OnBackPressedCallback
+     * — and the OS ends up firing the default handler, closing the
+     * shell. Explicitly overriding `onBackPressed` catches every path
+     * the AndroidX bridge might miss and keeps the app on the WebView.
+     * We never call `super.onBackPressed()` here, because doing so is
+     * what closes the Activity.
+     */
+    @Deprecated(
+        "AndroidX prefers OnBackPressedCallback, but we keep this override " +
+            "as a hard fallback for the OEM back-dispatcher races described above."
+    )
+    override fun onBackPressed() {
+        val canGoBack = web.canGoBack()
+        android.util.Log.d(
+            "WebCanvasActivity",
+            "onBackPressed(): canGoBack=$canGoBack url=$lastMainFrameUrl"
+        )
+        if (canGoBack) {
+            web.goBack()
+        }
+        // else: swallow. Never fall through to super — that finishes
+        // the Activity and closes the app.
+    }
+
+    /**
+     * Second safety net for physical HW back keys and OEM key routing
+     * that skips the OnBackInvokedDispatcher altogether. Returning
+     * `true` here consumes the event without ever invoking the
+     * Activity's default back behaviour.
+     */
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+        if (keyCode == android.view.KeyEvent.KEYCODE_BACK) {
+            val canGoBack = web.canGoBack()
+            android.util.Log.d(
+                "WebCanvasActivity",
+                "onKeyDown(BACK): canGoBack=$canGoBack url=$lastMainFrameUrl"
+            )
+            if (canGoBack) web.goBack()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     override fun onStart() {
