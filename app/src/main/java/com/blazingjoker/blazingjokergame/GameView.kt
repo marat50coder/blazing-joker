@@ -72,6 +72,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private val towers = ArrayList<Tower>()
     private val projectiles = ArrayList<Projectile>()
     private val effects = ArrayList<Effect>()
+    private val popups = ArrayList<Popup>()
 
     private var spawnQueue = ArrayList<Spawn>()
     private var spawnTimer = 0f
@@ -170,6 +171,22 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private inner class Effect(var x: Float, var y: Float, val color: Int, val maxR: Float) {
         var t = 0f
         val dur = 0.35f
+    }
+
+    /**
+     * Short-lived floating text drawn above an enemy at the moment it
+     * dies — carries the crystal reward that landed. Purely visual;
+     * has no gameplay side effects. Held in [popups] and cleared when
+     * [t] exceeds [dur]; the label drifts upward while fading out.
+     */
+    private inner class Popup(
+        val startX: Float,
+        val startY: Float,
+        val text: String,
+        val color: Int,
+    ) {
+        var t = 0f
+        val dur = 0.85f
     }
 
     private class Spawn(val type: Int, var delay: Float)
@@ -338,6 +355,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         spawnTimer = 0f
         phase = Phase.RUNNING
         Sfx.play(Sfx.SPAWN)
+        if (wave == 0 && !endless) Analytics.gameStart()
     }
 
     // ---- Game loop ------------------------------------------------------------------------
@@ -390,7 +408,12 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 lives -= enemyDamage[e.type]
                 Sfx.play(Sfx.HIT, 0.7f)
                 iter.remove()
-                if (lives <= 0) { lives = 0; phase = Phase.LOST; Sfx.play(Sfx.LOSE) }
+                if (lives <= 0) {
+                    lives = 0
+                    phase = Phase.LOST
+                    Sfx.play(Sfx.LOSE)
+                    Analytics.gameLose(wave + 1, endless)
+                }
                 continue
             }
             posAt(e.dist, tmp); e.x = tmp.x; e.y = tmp.y
@@ -434,6 +457,13 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             if (ef.t >= ef.dur) eit.remove()
         }
 
+        // Floating reward popups
+        val pop = popups.iterator()
+        while (pop.hasNext()) {
+            val pu = pop.next(); pu.t += dt
+            if (pu.t >= pu.dur) pop.remove()
+        }
+
         // Wave complete?
         if (phase == Phase.RUNNING && spawnQueue.isEmpty() && enemies.isEmpty()) {
             val bonus = 40 + wave * 12
@@ -445,6 +475,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             if (!endless && wave >= TOTAL_WAVES - 1) {
                 phase = Phase.WON
                 Sfx.play(Sfx.WIN)
+                Analytics.gameWin(wave + 1)
             } else {
                 wave++
                 phase = Phase.PREP
@@ -490,7 +521,16 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         e.hp -= dmg
         if (e.hp <= 0f) {
             e.alive = false
-            crystals += enemyReward[e.type]
+            val reward = enemyReward[e.type]
+            crystals += reward
+            // The floating reward label spawns slightly above the enemy
+            // sprite so it doesn't clip into the HP bar below the head.
+            popups.add(Popup(
+                startX = e.x,
+                startY = e.y - viewW * enemySizeFactor[e.type] * 0.5f,
+                text = "+$reward",
+                color = Color.parseColor("#FFB8F0FF"),
+            ))
             enemies.remove(e)
         }
     }
@@ -505,6 +545,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         drawEnemies(canvas)
         drawProjectiles(canvas)
         drawEffects(canvas)
+        drawPopups(canvas)
         drawHud(canvas)
 
         when (phase) {
@@ -649,6 +690,35 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             stroke.strokeWidth = 4f.dp
             canvas.drawCircle(ef.x, ef.y, r, stroke)
         }
+    }
+
+    /**
+     * Renders the floating '+N' reward labels. Each popup starts at the
+     * enemy's death position and drifts up ~28.dp over its lifetime
+     * while fading out on a decelerating curve — same shape the pilot
+     * uses for its progress bar so the two on-screen motions read as
+     * intentional siblings.
+     */
+    private fun drawPopups(canvas: Canvas) {
+        if (popups.isEmpty()) return
+        val prevAlign = textPaint.textAlign
+        val prevSize = textPaint.textSize
+        val prevColor = textPaint.color
+        textPaint.textAlign = Paint.Align.CENTER
+        textPaint.textSize = 16f.dp
+        for (pu in popups) {
+            val f = (pu.t / pu.dur).coerceIn(0f, 1f)
+            val ease = 1f - (1f - f) * (1f - f) // ease-out quad
+            val y = pu.startY - 28f.dp * ease
+            val alpha = 1f - f
+            textPaint.color = withAlpha(pu.color, alpha)
+            textPaint.setShadowLayer(6f, 0f, 2f, withAlpha(Color.BLACK, alpha * 0.65f))
+            canvas.drawText(pu.text, pu.startX, y, textPaint)
+        }
+        textPaint.clearShadowLayer()
+        textPaint.textAlign = prevAlign
+        textPaint.textSize = prevSize
+        textPaint.color = prevColor
     }
 
     private fun drawHud(canvas: Canvas) {
@@ -984,7 +1054,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     }
 
     private fun restart() {
-        enemies.clear(); towers.clear(); projectiles.clear(); effects.clear()
+        enemies.clear(); towers.clear(); projectiles.clear(); effects.clear(); popups.clear()
         spawnQueue.clear()
         crystals = START_CRYSTALS; lives = START_LIVES; wave = 0
         endless = false
@@ -1006,5 +1076,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         phase = Phase.PREP
         paused = false
         closePanels()
+        Analytics.endlessStarted()
     }
 }

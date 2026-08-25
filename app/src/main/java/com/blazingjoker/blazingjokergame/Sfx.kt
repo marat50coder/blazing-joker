@@ -26,6 +26,12 @@ object Sfx {
     private val all = listOf(CLICK, SPAWN, SHOOT, COIN, WIN, LOSE, BOSS, BUILD, HIT)
 
     fun init(context: Context) {
+        // Track the persisted setting on every init — this also covers
+        // the case where init() runs against an already-loaded pool but
+        // the user has toggled sound in the Settings screen since then.
+        GamePrefs.init(context)
+        enabled = GamePrefs.sfxEnabled
+
         if (loaded) return
         val attrs = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_GAME)
