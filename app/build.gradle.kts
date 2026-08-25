@@ -19,8 +19,8 @@ android {
         applicationId = "com.blazingjoker.blazingjokergame"
         minSdk = 24
         targetSdk = 35
-        versionCode = 14
-        versionName = "1.0.1"
+        versionCode = 16
+        versionName = "1.0.2"
 
         // AndroidX security library uses vector drawables for the crypto UI on older APIs
         vectorDrawables { useSupportLibrary = true }
@@ -91,9 +91,10 @@ dependencies {
     // marked deprecated; still perfectly safe for our small key set.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
-    // ── Firebase (BOM keeps every messaging transitive in sync) ──
+    // ── Firebase (BOM keeps every messaging + analytics transitive in sync) ──
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging-ktx")
+    implementation("com.google.firebase:firebase-analytics-ktx")
 
     // ── AppsFlyer Android SDK (native, not the Flutter plugin) ──
     implementation("com.appsflyer:af-android-sdk:6.16.2")

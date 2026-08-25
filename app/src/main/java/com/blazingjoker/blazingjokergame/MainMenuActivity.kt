@@ -20,6 +20,7 @@ class MainMenuActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         Ui.immersive(this)
         Sfx.init(this)
+        Analytics.menuOpened()
 
         val root = FrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -38,6 +39,35 @@ class MainMenuActivity : AppCompatActivity() {
             setImageResource(R.drawable.loading_vertical)
         }
         root.addView(bg)
+
+        // Gear icon in the top-right — a plain unicode glyph on a
+        // circular pill so we don't need to ship a new vector asset for
+        // this update.
+        val gear = TextView(this).apply {
+            text = "\u2699"
+            setTextColor(Color.parseColor("#FFFFE08A"))
+            textSize = 26f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#B32A0E3F"))
+                setStroke(2.dp, Color.parseColor("#88F6C13A"))
+            }
+            isClickable = true
+            isFocusable = true
+            contentDescription = getString(R.string.settings)
+            setOnClickListener {
+                Sfx.play(Sfx.CLICK)
+                startActivity(Intent(this@MainMenuActivity, SettingsActivity::class.java))
+            }
+            layoutParams = FrameLayout.LayoutParams(52.dp, 52.dp).apply {
+                gravity = Gravity.TOP or Gravity.END
+                topMargin = 20.dp
+                marginEnd = 20.dp
+            }
+        }
+        root.addView(gear)
 
         // Bottom controls
         val controls = LinearLayout(this).apply {
