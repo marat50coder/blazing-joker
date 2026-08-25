@@ -39,7 +39,15 @@ internal class CampaignBroker(private val app: Application) {
 
     private val wired = AtomicBoolean(false)
     private val speaking = AtomicBoolean(false)
-    private val installReady = CompletableDeferred<Map<String, Any?>>()
+
+    // The install-conversion deferred is reset by [reAskAppsFlyer] when a
+    // prior AppsFlyer callback completed it with an empty map — that shape
+    // is the fingerprint of an offline / failing SDK start, and we need a
+    // fresh sink so a re-invoked `AppsFlyerLib.start(host)` can settle a
+    // real answer into it. Volatile so a reader on any thread sees the
+    // swap without needing external synchronisation.
+    @Volatile
+    private var installReady: CompletableDeferred<Map<String, Any?>> = CompletableDeferred()
 
     @Volatile
     private var deepLinkFacts: Map<String, Any?>? = null
@@ -105,7 +113,24 @@ internal class CampaignBroker(private val app: Application) {
     fun start(host: Activity) {
         wireUp()
         if (LinkConfig.attributionKey().isEmpty()) return
-        if (!speaking.compareAndSet(false, true)) return
+
+        val firstTime = speaking.compareAndSet(false, true)
+        if (!firstTime) {
+            // AppsFlyer has already been started at least once in this
+            // process. Only re-invoke it if the prior start yielded no
+            // usable attribution (empty map) — that shape is what an
+            // offline / failing SDK boot leaves behind, and a re-start
+            // with a fresh CompletableDeferred is the recovery path the
+            // neighbour shells use (Deep-Bass-Quest reAsk / magma-coins
+            // askAgain). A non-empty prior answer is authoritative and
+            // must NOT be overwritten by a re-ask.
+            if (!installReady.isCompleted) return
+            val prev = runCatching { installReady.getCompleted() }.getOrDefault(emptyMap())
+            if (prev.isNotEmpty()) return
+            installReady = CompletableDeferred()
+            Log.d(TAG, "start(reAsk) — previous answer was empty, retrying AF")
+        }
+
         runCatching {
             AppsFlyerLib.getInstance().start(host)
             Log.d(TAG, "start(${host.javaClass.simpleName})")

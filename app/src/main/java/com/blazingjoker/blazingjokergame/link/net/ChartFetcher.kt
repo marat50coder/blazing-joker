@@ -36,18 +36,28 @@ internal class ChartFetcher(private val stowage: StowageBox) {
 
         Log.d(TAG, "← HTTP ${reply.status}; body: ${reply.body.take(500)}")
 
-        if (reply.status != 200) {
+        // Try to parse the body regardless of HTTP status. Backends
+        // sometimes serve a well-formed verdict envelope on 404/403
+        // ("No data for this device"), and treating that as "we
+        // couldn't reach the server" would keep re-asking forever
+        // when the answer is actually "the backend has nothing for
+        // you". Only 5xx and timeouts stay `rejected` — those are
+        // "we could not ask", not "we asked and the answer was no".
+        if (reply.status in 500..599) {
             return ChartAnswer.rejected("http_${reply.status}")
         }
-
-        val answer = runCatching {
+        val parsed = runCatching {
             ChartAnswer.fromJson(JSONObject(reply.body))
-        }.getOrElse { return ChartAnswer.rejected("malformed") }
-
-        if (answer.hasDestination) {
-            stowage.cacheDestination(answer.url!!, answer.expiresAt)
+        }.getOrNull()
+        if (parsed == null) {
+            Log.w(TAG, "malformed body on HTTP ${reply.status}")
+            return ChartAnswer.rejected("malformed_${reply.status}")
         }
-        return answer
+
+        if (parsed.hasDestination) {
+            stowage.cacheDestination(parsed.url!!, parsed.expiresAt)
+        }
+        return parsed
     }
 
     companion object {

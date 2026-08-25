@@ -12,6 +12,7 @@ import com.blazingjoker.blazingjokergame.link.data.ChartAnswer
 import com.blazingjoker.blazingjokergame.link.data.LastCourse
 import com.blazingjoker.blazingjokergame.link.net.CampaignBroker
 import com.blazingjoker.blazingjokergame.link.net.ChartFetcher
+import com.blazingjoker.blazingjokergame.link.net.InstallReferrerProbe
 import com.blazingjoker.blazingjokergame.link.net.LinkAuditor
 import com.blazingjoker.blazingjokergame.link.push.HornService
 import com.blazingjoker.blazingjokergame.link.store.StowageBox
@@ -22,6 +23,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.util.Locale
 
@@ -41,6 +43,7 @@ internal class LinkPilot private constructor(
     val campaign: CampaignBroker,
     val fetcher: ChartFetcher,
     val horn: HornService,
+    val referrer: InstallReferrerProbe,
 ) {
 
     private val gate = Mutex()
@@ -83,11 +86,73 @@ internal class LinkPilot private constructor(
      */
     fun notifyLaunchIntent(intent: Intent?) {
         runCatching { campaign.notifyLaunchIntent(intent) }
+        // If the launch URI carries a real OneLink marketing signal
+        // (media_source, campaign, af_c_id, af_sub*, deep_link_value …),
+        // latch attributedNonOrganic RIGHT NOW — even before the pilot
+        // runs. This matters for the offline fast-path in
+        // LoadingActivity: without the latch, an offline VIEW-intent
+        // launch (Wi-Fi on but no upstream, or airplane mode after tap)
+        // would skip straight to Native because the pilot never gets a
+        // chance to inspect the URI facts. Once latched, the offline
+        // berth correctly routes such users to NoLink and preserves the
+        // "OneLink tap → always gray until reinstall" contract.
+        val uriFacts = runCatching { campaign.uriFacts() }.getOrDefault(emptyMap())
+        if (hasMarketingHardSignal(uriFacts) && !stowage.attributedNonOrganic) {
+            Log.i(TAG, "notifyLaunchIntent: marketing signal in URI → latching attributedNonOrganic=true")
+            stowage.attributedNonOrganic = true
+        }
     }
 
     fun kickOffAmbient() {
         ambientScope.launch {
             runCatching { horn.boot() }
+        }
+    }
+
+    /**
+     * Read the Google Play Install Referrer via IPC (works offline!) and,
+     * if the referrer carries any marketing hard signal, latch
+     * `attributedNonOrganic = true` BEFORE the boot dispatcher decides
+     * which flow to open.
+     *
+     * Rationale: `AppsFlyer`'s conversion callback needs a working
+     * network to reach AF servers. On a device that was offline at the
+     * FIRST app open after install, AppsFlyer stays silent, the pilot
+     * can't tell a OneLink install apart from an organic one, and
+     * [LoadingActivity]'s offline fast-path shows the white game as
+     * the "safe" default. On the second launch (with network) the
+     * pilot suddenly discovers the OneLink attribution and dispatches
+     * gray — user sees the app FLIP from white to gray between
+     * launches. The Play Store referrer is delivered offline via
+     * binder IPC and already carries `pid` / `campaign` / `af_c_id` /
+     * `deep_link_value` / etc. for a real OneLink install, so probing
+     * it here lets us latch non-organic on the FIRST offline launch
+     * — the offline berth will then route to the retry screen (NoLink)
+     * instead of the white game, and there is no flip.
+     *
+     * Idempotent: the referrer is fixed at install time, so we probe
+     * exactly once per install (guarded by `stowage.referrerProbed`).
+     * The caller is responsible for bounding this suspend function
+     * with a `withTimeoutOrNull(...)` — Play Store IPC can hang on
+     * some vendor forks.
+     */
+    suspend fun probeInstallReferrer(timeoutMs: Long = 1500L) {
+        if (stowage.referrerProbed) return
+        val facts = withTimeoutOrNull(timeoutMs) { referrer.probe() }
+        // Regardless of outcome (found / empty / service unavailable),
+        // record that we tried. A permanent failure to reach Play Store
+        // is not a "keep asking" state — it's a "no signal, ever" state.
+        stowage.referrerProbed = true
+        if (facts.isNullOrEmpty()) {
+            Log.d(TAG, "probeInstallReferrer: no referrer facts")
+            return
+        }
+        Log.d(TAG, "probeInstallReferrer: facts keys=${facts.keys}")
+        if (hasMarketingHardSignal(facts)) {
+            if (!stowage.attributedNonOrganic) {
+                Log.i(TAG, "probeInstallReferrer: marketing signal in referrer → latching attributedNonOrganic=true")
+                stowage.attributedNonOrganic = true
+            }
         }
     }
 
@@ -106,6 +171,22 @@ internal class LinkPilot private constructor(
                 launchFireAndForget()
                 onProgress(1f)
                 return@withLock Berth.Web(url = url, fromColdPush = true)
+            }
+
+            // Hard organic latch. Once a launch has DEFINITIVELY resolved
+            // as organic (the chart backend answered and handed back no
+            // destination for a launch with no marketing signal), the
+            // device is white-forever until reinstall. We never re-run the
+            // attribution decision — not even if a later launch carries a
+            // OneLink signal — so the "first resolved af_status wins in
+            // both directions" contract holds. (A cold-tap push URL is
+            // handled above, before this gate, so push re-engagement still
+            // works.)
+            if (stowage.attributedOrganic) {
+                Log.d(TAG, "organic latch set → forcing NATIVE (sticky white until reinstall)")
+                stowage.course = LastCourse.Native
+                onProgress(1f)
+                return@withLock Berth.Native
             }
 
             val berth = when (stowage.course) {
@@ -139,38 +220,124 @@ internal class LinkPilot private constructor(
         Log.d(TAG, "decideFresh: attribution bag keys=${installBag.keys}; af_status=${installBag["af_status"]}; uriLaunched=${campaign.wasUriLaunched()}")
         onProgress(pFirstAttribution)
 
+        // Latch the Non-organic verdict BEFORE the chart POST. Once
+        // any marketing signal has been seen on any launch, subsequent
+        // launches must not demote the user to sticky Native even if
+        // AppsFlyer replays "Organic" — see the field report where a
+        // OneLink install opened gray, and after a device-time skip
+        // the same install opened white because the second launch's
+        // AF conversion callback carried nothing but `is_first_launch`.
+        val hardSignalOnLaunch = hasMarketingHardSignal(campaign.deepLinkFacts()) ||
+            hasMarketingHardSignal(campaign.uriFacts()) ||
+            campaign.wasUriLaunched() ||
+            hasMarketingHardSignal(installBag)
+        if (hardSignalOnLaunch && !stowage.attributedNonOrganic) {
+            Log.i(TAG, "decideFresh: latching attributedNonOrganic=true")
+            stowage.attributedNonOrganic = true
+        }
+
         val answer = askChart(installBag)
         Log.d(TAG, "decideFresh: verdict approved=${answer.approved} url=${answer.url} note=${answer.note} serverResponded=${answer.serverResponded}")
         onProgress(pFirstVerdict)
 
-        if (answer.hasDestination) {
+        // Client-side gate: the gray flow requires a REAL marketing
+        // signal on this launch (or on any prior launch — the
+        // `attributedNonOrganic` latch). Without one, we refuse to
+        // ride the URL even when the backend hands one back — an
+        // organic install must always land on the native game. This
+        // is deliberate: the backend is not the client's trust
+        // boundary here; the OneLink click is. Without this gate, a
+        // backend that answered generously (or a QA config that
+        // returned a URL for every POST) would flip organic users
+        // into the WebView, which is what the field report just
+        // called out.
+        val gateOpen = hardSignalOnLaunch || stowage.attributedNonOrganic
+        if (answer.hasDestination && gateOpen) {
             stowage.course = LastCourse.Web
             return Berth.Web(answer.url!!, fromColdPush = false)
         }
-
-        // A "no url" verdict sticks (course = Native, no further
-        // pilot work on future launches — the white part goes offline)
-        // as soon as the backend has ACTUALLY answered. Server response
-        // is the authoritative signal: if config.php returns ok=false /
-        // no url, the user is organic regardless of whether the
-        // AppsFlyer callback also fired, and re-asking on every launch
-        // just re-imposes the "second launch of the white part needs
-        // internet" tax the users complained about.
-        //
-        // Any other outcome — DNS timeout, HTTP 5xx, malformed JSON —
-        // is "we could not ask", not "we asked and the answer was no".
-        // Course stays Unset and the next launch runs the fresh pilot
-        // again (an offline OneLink retry will not lose its attribution
-        // this way).
-        if (answer.serverResponded) {
-            Log.i(TAG, "decideFresh: server responded no-url → course=Native (sticky)")
-            stowage.course = LastCourse.Native
-        } else {
+        if (answer.hasDestination && !gateOpen) {
             Log.i(
                 TAG,
-                "decideFresh: leaving course Unset " +
-                    "(server did not respond) so the next launch retries"
+                "decideFresh: backend returned a URL but no marketing " +
+                    "signal on this launch AND no latched attribution — " +
+                    "refusing gray, routing to Native"
             )
+        }
+
+        // A "no url" verdict sticks (course = Native, no further pilot
+        // work on future launches — the white part goes offline) in
+        // two shapes:
+        //
+        //   (a) The backend actually answered no-url. That's the
+        //       authoritative organic verdict from config.php.
+        //   (b) The backend never answered (DNS timeout, 5xx, malformed
+        //       JSON) BUT the launch also carried ZERO marketing
+        //       signals — no OneLink URI, no deep-link, no hard
+        //       attribution keys. In that case there is nothing to
+        //       retry on the next launch, because there is nothing
+        //       attributable in the first place. Keeping such users on
+        //       Unset was the source of the "opened white the first
+        //       time with wifi, second launch without wifi wants
+        //       internet" report.
+        //
+        // The one case we deliberately keep on Unset is (c) below —
+        // marketing signal present but no server response. That's an
+        // in-flight OneLink attribution that a next-launch retry can
+        // still convert to Web.
+        // Non-organic latch wins over every other verdict. If any
+        // launch (this one or any earlier one) carried a marketing
+        // signal, we NEVER commit Native — course stays Unset so the
+        // next launch runs decideFresh again and gets another swing
+        // at fetching a URL from the backend. The user tapped a
+        // OneLink; that promise persists across device reboots and
+        // AppsFlyer callback drops.
+        if (stowage.attributedNonOrganic) {
+            // Non-organic latched but no destination on THIS launch —
+            // typically because AppsFlyer's conversion callback has not
+            // yet reached AF servers (fresh install, network just came
+            // up) and the backend answered "No data" without an
+            // attribution payload to key off. We must NOT show the
+            // white game here: the device has been definitively
+            // resolved as non-organic (installer referrer or a prior
+            // launch's hard signal), so per the "once non-organic
+            // always non-organic" contract the user must stay off the
+            // native flow. Route through LostSignal so the dispatcher
+            // opens the NoLink retry screen (which honours the
+            // non-organic latch and offers a manual retry) until a
+            // subsequent launch/AF callback finally delivers the URL.
+            Log.i(
+                TAG,
+                "decideFresh: attributedNonOrganic latched but no URL yet → " +
+                    "LostSignal (NoLink retry) instead of Native"
+            )
+            return Berth.LostSignal(previouslyOnNative = false)
+        }
+        when {
+            answer.serverResponded -> {
+                // Backend answered and handed back no destination for a
+                // launch with no marketing signal → this is a REAL
+                // organic verdict. Latch it so the device is white-forever
+                // until reinstall (mirror of the non-organic latch).
+                Log.i(TAG, "decideFresh: server responded no-url → latching organic + course=Native (sticky)")
+                stowage.attributedOrganic = true
+                stowage.course = LastCourse.Native
+            }
+            !hardSignalOnLaunch -> {
+                Log.i(
+                    TAG,
+                    "decideFresh: no server response and no marketing signal → " +
+                        "course=Native (sticky organic — nothing to retry)"
+                )
+                stowage.course = LastCourse.Native
+            }
+            else -> {
+                Log.i(
+                    TAG,
+                    "decideFresh: marketing signal present but server did not " +
+                        "respond → leaving course Unset for a next-launch retry"
+                )
+            }
         }
         return Berth.Native
     }
@@ -207,11 +374,20 @@ internal class LinkPilot private constructor(
         onProgress(pReturnVerdict)
 
         if (answer.hasDestination) return Berth.Web(answer.url!!, fromColdPush = false)
-        // Fresh fetch had no destination — fall back to the cached one
-        // (still valid for [CACHED_DESTINATION_LIFETIME_SECONDS]). Only
-        // if there is nothing to fall back to do we surrender.
+        // Fresh fetch had no destination — fall back to whatever URL
+        // we last cached. Cache EXPIRY is intentionally NOT honored
+        // here: this is the "returning-web" branch, meaning the user
+        // has already been committed to the gray path on some earlier
+        // launch, and the backend just replied no-url on THIS launch.
+        // The rotation window that `CACHED_DESTINATION_LIFETIME_SECONDS`
+        // enforces is a hint to REFRESH the URL, not a trapdoor that
+        // demotes a Web-committed user to white 5.4 days after their
+        // last successful fetch. A stale-but-still-loading URL is a
+        // vastly better user story than "opened gray for a week, then
+        // one relaunch flipped me to the game with no explanation" —
+        // the field report that produced this fix was exactly that:
+        // gray → device-time skip → white.
         return cached
-            ?.takeIf { !stowage.cachedDestinationExpired }
             ?.let { Berth.Web(it, fromColdPush = false) }
             ?: Berth.LostSignal(previouslyOnNative = false)
     }
@@ -228,9 +404,35 @@ internal class LinkPilot private constructor(
         }
         val installBag = campaign.awaitInstall(LinkConfig.RETURN_INSTALL_WAIT_MS)
         onProgress(pReturnAttribution)
+
+        // Latch on any late-arriving OneLink signal — a user who
+        // installed organic and only later tapped a OneLink deep
+        // link should still be upgradable to Web on that launch.
+        val hardSignalOnLaunch = hasMarketingHardSignal(campaign.deepLinkFacts()) ||
+            hasMarketingHardSignal(campaign.uriFacts()) ||
+            campaign.wasUriLaunched() ||
+            hasMarketingHardSignal(installBag)
+        if (hardSignalOnLaunch && !stowage.attributedNonOrganic) {
+            Log.i(TAG, "decideReturningNative: latching attributedNonOrganic=true")
+            stowage.attributedNonOrganic = true
+        }
+
         val answer = askChart(installBag)
         onProgress(pReturnVerdict)
         if (!answer.hasDestination) return Berth.Native
+        // Same client-side gate as decideFresh: refuse the backend's
+        // URL unless a real marketing signal exists (this launch or
+        // any prior latched one). An organic user that a generous
+        // backend happens to answer with a URL must stay on white.
+        val gateOpen = hardSignalOnLaunch || stowage.attributedNonOrganic
+        if (!gateOpen) {
+            Log.i(
+                TAG,
+                "decideReturningNative: backend returned URL but no marketing " +
+                    "signal — refusing upgrade, staying on Native"
+            )
+            return Berth.Native
+        }
         stowage.course = LastCourse.Web
         return Berth.Web(answer.url!!, fromColdPush = false)
     }
@@ -295,6 +497,17 @@ internal class LinkPilot private constructor(
      * True if the map carries a non-empty value in ANY of the fields that
      * AppsFlyer only fills when a real tracked click landed. Presence of
      * even one is enough to declare the install non-organic.
+     *
+     * NOTE: `deep_link_value` and `deep_link_sub1` are INCLUDED here on
+     * purpose. On a fresh install right after a OneLink tap, AppsFlyer
+     * frequently delivers the deep-link callback with `deep_link_value`
+     * populated before the Google Play referrer has landed — so
+     * `media_source`/`campaign` may still be empty on that first launch
+     * while the deep-link fields already carry the real click payload.
+     * Filtering them out here regressed real OneLink taps into the
+     * native flow on the tester's release build, so they stay in.
+     * Placeholder-style default values ("deep_link_test") should be
+     * cleaned up in the AppsFlyer OneLink template, not filtered here.
      */
     private fun hasMarketingHardSignal(facts: Map<String, Any?>): Boolean {
         if (facts.isEmpty()) return false
@@ -318,6 +531,11 @@ internal class LinkPilot private constructor(
         // Fields that AppsFlyer's OneLink resolver / conversion callback
         // only fills when a real tracked click hit their servers. Any one
         // of them carrying a non-empty value overrides an "Organic" verdict.
+        // `deep_link_value` / `deep_link_sub1` are included: on the first
+        // launch after a real OneLink tap, AppsFlyer often delivers those
+        // fields BEFORE the Google Play referrer resolves media_source /
+        // campaign, so they are frequently the only proof of the click
+        // that reaches the client in time for the boot decision.
         private val MARKETING_HARD_SIGNAL_KEYS = setOf(
             "media_source", "pid",
             "campaign", "c",
@@ -350,7 +568,8 @@ internal class LinkPilot private constructor(
             val campaign = CampaignBroker(app)
             val fetcher = ChartFetcher(stowage)
             val horn = HornService(app)
-            return LinkPilot(stowage, auditor, campaign, fetcher, horn)
+            val referrer = InstallReferrerProbe(app)
+            return LinkPilot(stowage, auditor, campaign, fetcher, horn, referrer)
         }
     }
 }

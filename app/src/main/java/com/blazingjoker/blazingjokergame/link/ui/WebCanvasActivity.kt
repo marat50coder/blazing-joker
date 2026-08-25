@@ -108,7 +108,33 @@ class WebCanvasActivity : AppCompatActivity() {
     private lateinit var kbd: KbdSlide
     private var carrierWatcher: ConnectivityManager.NetworkCallback? = null
     private val handler = Handler(Looper.getMainLooper())
-    private val dropDebounce = Runnable { forwardToOffline() }
+    private val dropDebounce = Runnable {
+        // Never drop to NoLink from a spurious network flip. Real drops
+        // reproduce here: (a) `retryPending` clears once the recovery
+        // reload commits — do not surrender during recovery; (b) the
+        // system-level `hasCarrier()` re-check is the source of truth
+        // after the debounce, because `onLost` fires for individual
+        // network handles too (Wi-Fi → cellular hand-off), even when the
+        // device still has connectivity via the other transport.
+        if (retryPending) {
+            android.util.Log.d(
+                "WebCanvasActivity",
+                "dropDebounce: retryPending — skip offline"
+            )
+            return@Runnable
+        }
+        val stillOnline = runCatching {
+            LinkPilot.of(this@WebCanvasActivity).auditor.hasCarrier()
+        }.getOrDefault(false)
+        if (stillOnline) {
+            android.util.Log.d(
+                "WebCanvasActivity",
+                "dropDebounce: still have carrier — skip offline"
+            )
+            return@Runnable
+        }
+        forwardToOffline()
+    }
     private val coverTimeout = Runnable {
         // Safety net for a page that never reports back — never leave the
         // user under an opaque overlay for longer than [COVER_MAX_MS].
@@ -263,7 +289,7 @@ class WebCanvasActivity : AppCompatActivity() {
                     "WebCanvasActivity",
                     "OnBackPressedCallback: canGoBack=$canGoBack url=$lastMainFrameUrl"
                 )
-                if (canGoBack) web.goBack()
+                if (canGoBack) navigateBackInWeb()
                 // else: do nothing — swallow the press so we stay on the
                 // current WebView page. The callback is always enabled
                 // so the dispatcher must not fall through to the
@@ -539,10 +565,44 @@ class WebCanvasActivity : AppCompatActivity() {
             }, RELOAD_GRACE_MS)
             return
         }
+        // Budget spent AND the entry URL was tried. Only surrender to the
+        // offline screen if we can PROVE there is no carrier — otherwise
+        // the loop is a partner-side glitch and dropping into NoLink here
+        // would look to the user like "no wifi appeared while wifi is on"
+        // (reproduced when back-navigating through a chain that used to
+        // resolve but now re-triggers the redirect budget). Reload the
+        // last page that actually committed instead; the user stays where
+        // they were.
+        val stillOnline = runCatching {
+            LinkPilot.of(this@WebCanvasActivity).auditor.hasCarrier()
+        }.getOrDefault(false)
+        if (stillOnline) {
+            android.util.Log.d(
+                "WebCanvasActivity",
+                "handleRedirectLoop: budget exhausted but carrier still up — " +
+                    "reloading last committed page instead of NoLink"
+            )
+            val restoreTo = lastMainFrameUrl
+            if (!restoreTo.isNullOrBlank() && restoreTo != BLANK) {
+                retryPending = true
+                redirectRetries = 0
+                entryPointRetried = false
+                engine.postDelayed({
+                    if (!isFinishing && !isDestroyed) {
+                        runCatching {
+                            engine.stopLoading()
+                            engine.loadUrl(restoreTo)
+                        }
+                    }
+                }, RELOAD_GRACE_MS)
+                return
+            }
+            // No last-committed page yet — leave the cover up rather than
+            // surrender; the cover timeout will lift it after COVER_MAX_MS.
+            retryPending = false
+            return
+        }
         retryPending = false
-        // Budget spent AND the entry URL was tried — fall through to the
-        // offline screen; without this the user would sit under the black
-        // cover forever.
         runCatching {
             engine.stopLoading()
             engine.loadUrl(BLANK)
@@ -595,6 +655,24 @@ class WebCanvasActivity : AppCompatActivity() {
 
     private fun forwardToOffline() {
         if (offlineShown) return
+        // Hard invariant: NoLink is a "no wifi" screen. Never show it
+        // while the device still has a carrier — this used to flash a
+        // false NoLink between a mid-session error and the actual
+        // recovery reload, and users read it as "the app is broken".
+        // Callers that need to nudge the WebView back to a working
+        // page have their own paths (onReceivedError → restoreTo,
+        // handleRedirectLoop → reload lastMainFrameUrl). This method
+        // is exclusively the "we truly have no network" trapdoor.
+        val stillOnline = runCatching {
+            LinkPilot.of(this).auditor.hasCarrier()
+        }.getOrDefault(false)
+        if (stillOnline) {
+            android.util.Log.d(
+                "WebCanvasActivity",
+                "forwardToOffline: skipped, still have carrier"
+            )
+            return
+        }
         offlineShown = true
         val currentUrl = lastMainFrameUrl ?: intent.getStringExtra(EXTRA_URL).orEmpty()
         val i = Intent(this, NoLinkActivity::class.java).apply {
@@ -635,7 +713,7 @@ class WebCanvasActivity : AppCompatActivity() {
             "onBackPressed(): canGoBack=$canGoBack url=$lastMainFrameUrl"
         )
         if (canGoBack) {
-            web.goBack()
+            navigateBackInWeb()
         }
         // else: swallow. Never fall through to super — that finishes
         // the Activity and closes the app.
@@ -654,10 +732,25 @@ class WebCanvasActivity : AppCompatActivity() {
                 "WebCanvasActivity",
                 "onKeyDown(BACK): canGoBack=$canGoBack url=$lastMainFrameUrl"
             )
-            if (canGoBack) web.goBack()
+            if (canGoBack) navigateBackInWeb()
             return true
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    /**
+     * Wraps `web.goBack()` with a redirect-budget reset. Without this the
+     * chain the user is walking back through can immediately trip
+     * [handleRedirectLoop] with a stale, already-decremented retry count
+     * — the user then sees the NoLink screen appear after "just pressing
+     * back". Every back navigation deserves a fresh 2-hop budget.
+     */
+    private fun navigateBackInWeb() {
+        redirectRetries = 0
+        entryPointRetried = false
+        retryPending = false
+        hasErroredThisLoad = false
+        web.goBack()
     }
 
     override fun onStart() {
@@ -670,6 +763,43 @@ class WebCanvasActivity : AppCompatActivity() {
                 if (!isFinishing && !isDestroyed) loadPushUrl(url)
             }
         }
+        // Warm re-invite. Cold launches route through LoadingActivity
+        // which already asks `shouldInvitePermission()` before
+        // dispatching, but a warm relaunch (task resumed from recents,
+        // launcher tap on a still-alive process) bypasses
+        // LoadingActivity entirely — without this check the "Skip →
+        // 2 d 20 h later" reappearance never fires for users who never
+        // kill the app between test runs. shouldInvitePermission()
+        // already returns false when granted/hard-blocked/still-snoozed,
+        // so this cannot loop.
+        maybeReInviteNotifications()
+    }
+
+    private var reInviteInFlight = false
+
+    private fun maybeReInviteNotifications() {
+        if (reInviteInFlight) return
+        val pilot = LinkPilot.of(this)
+        if (!pilot.stowage.shouldInvitePermission(this)) return
+        android.util.Log.d(
+            "WebCanvasActivity",
+            "onStart: snooze elapsed → showing AlertOptIn on top"
+        )
+        // Latch until the AlertOptIn has had time to reach the
+        // foreground; without this, a double onStart (config change,
+        // OEM window-focus race) would stack two AlertOptIn copies.
+        // Cleared on the very next onStart after user interaction
+        // (Skip/Accept refreshes the snooze, so the check below returns
+        // false and no relaunch happens anyway — the flag is only a
+        // guard against the double-fire race, not the loop guard).
+        reInviteInFlight = true
+        handler.postDelayed({ reInviteInFlight = false }, 2_000L)
+        // Empty destination on purpose — AlertOptInActivity.forward()
+        // treats an empty EXTRA_DESTINATION_URL as "just close and go
+        // back to whoever launched me", so the WebView underneath keeps
+        // its session.
+        val i = Intent(this, AlertOptInActivity::class.java)
+        startActivity(i)
     }
 
     override fun onStop() {

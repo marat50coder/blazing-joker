@@ -124,6 +124,28 @@ class LoadingActivity : AppCompatActivity() {
             pilot.stowage.stashPendingUrl(coldUrl)
         }
 
+        // On the VERY FIRST launch after install we must consult the
+        // Google Play Install Referrer BEFORE any fast-path can commit
+        // an offline berth. Without this, a OneLink install opened
+        // before the device is online takes the "no carrier" fast path
+        // straight into the white game, and a later launch (once
+        // network is up) flips the same install into gray — the
+        // reported "белая → серая" bug. The referrer is delivered
+        // offline via binder IPC and carries the OneLink parameters,
+        // so probing it here is our only offline channel to detect a
+        // tracked click. Guarded by `referrerProbed` — we only pay
+        // this cost once per install.
+        if (!pilot.stowage.referrerProbed) {
+            Log.d(TAG, "first launch: probing install referrer before dispatch")
+            buildScreen()
+            pilot.kickOffAmbient()
+            loaderScope.launch {
+                withContext(Dispatchers.IO) { pilot.probeInstallReferrer() }
+                decideAfterProbe(pilot, coldUrl)
+            }
+            return
+        }
+
         // Fast path #1: last-known course is Native. Once we have
         // committed a user to the white-part game, every subsequent
         // launch MUST reach the menu even fully offline — the native
@@ -140,16 +162,22 @@ class LoadingActivity : AppCompatActivity() {
             return
         }
 
-        // Fast path #2: no carrier at all. Showing the splash + progress
-        // bar for a decision that literally cannot be made (attribution
-        // needs the network, cache needs a URL to hand back) just adds
-        // a gratuitous "loading → error" flash. Sibling shells
-        // (foollegends WelcomePortal) do the same — offline first frame,
-        // no splash.
+        // Fast path #2: no USABLE internet. `hasValidatedInternet()` is
+        // strictly stronger than `hasCarrier()` — it also requires
+        // Android's own captive-portal probe to have succeeded, so the
+        // "wifi on, no upstream" case (airport captive without login,
+        // dead-ISP, expired mobile-data plan) trips this branch even
+        // though a network transport is technically up. Without this,
+        // the pilot runs on such a device and eats ~12 s on DNS probes
+        // and ~26 s on AppsFlyer's install-wait before returning
+        // LostSignal — the user just saw ~40 s of white loading for
+        // nothing. From their seat, opening straight to the offline
+        // berth reads the same but 40 s sooner.
         if (LinkConfig.credentialsReady &&
             coldUrl.isEmpty() &&
-            !pilot.auditor.hasCarrier()
+            !pilot.auditor.hasValidatedInternet()
         ) {
+            Log.d(TAG, "fast-path: no validated internet → offline berth without pilot")
             skipToOfflineBerth(pilot)
             return
         }
@@ -159,23 +187,82 @@ class LoadingActivity : AppCompatActivity() {
     }
 
     /**
+     * Post-probe branch: the install-referrer probe has finished (or
+     * timed out) and any offline-detectable marketing signal has been
+     * latched into `attributedNonOrganic`. From here the same fast-path
+     * ladder as [onCreate] applies — the ONLY difference is that the
+     * offline branch now knows the user is non-organic and routes to
+     * NoLink (retry) instead of the white game.
+     */
+    private fun decideAfterProbe(pilot: LinkPilot, coldUrl: String) {
+        if (isFinishing) return
+
+        if (LinkConfig.credentialsReady &&
+            coldUrl.isEmpty() &&
+            pilot.stowage.course == LastCourse.Native
+        ) {
+            Log.d(TAG, "post-probe fast-path: course=Native → MainMenu")
+            skipToOfflineBerth(pilot)
+            return
+        }
+
+        if (LinkConfig.credentialsReady &&
+            coldUrl.isEmpty() &&
+            !pilot.auditor.hasValidatedInternet()
+        ) {
+            Log.d(TAG, "post-probe: no validated internet → offline berth")
+            skipToOfflineBerth(pilot)
+            return
+        }
+
+        // Online: run the pilot as usual.
+        launchPilot()
+    }
+
+    /**
      * No carrier + credentials plumbed in → dispatch immediately based on
      * last-known course. Never blocks on I/O and never runs the pilot.
      *   Native → game (fully offline-capable)
-     *   Web    → offline retry screen with the last URL for a resume load
-     *   Unset  → offline retry screen; a first-online launch runs the
-     *            full pilot from scratch
+     *   Web + cached URL → offline retry screen with the last URL for a resume load
+     *   Web + no cache  → NoLink (nothing else to resume to)
+     *   Unset + no cache → game (organic default; the white part has no
+     *                     network dependency, so trapping the user on
+     *                     NoLink here just means "opened white the first
+     *                     time, second launch offline requires internet")
+     *   Unset + cache   → NoLink (there is a pending Web URL to resume to)
      */
     private fun skipToOfflineBerth(pilot: LinkPilot) {
-        Log.d(TAG, "skipToOfflineBerth course=${pilot.stowage.course}")
+        val cached = pilot.stowage.cachedDestination().orEmpty()
+        val nonOrg = pilot.stowage.attributedNonOrganic
+        Log.d(
+            TAG,
+            "skipToOfflineBerth course=${pilot.stowage.course} " +
+                "cachedNonEmpty=${cached.isNotEmpty()} nonOrganic=$nonOrg"
+        )
         val next: Intent = when (pilot.stowage.course) {
             LastCourse.Native -> Intent(this, MainMenuActivity::class.java)
-            LastCourse.Web, LastCourse.Unset -> {
-                val cached = pilot.stowage.cachedDestination().orEmpty()
-                Intent(this, NoLinkActivity::class.java).apply {
+            LastCourse.Web -> Intent(this, NoLinkActivity::class.java).apply {
+                if (cached.isNotEmpty()) {
+                    putExtra(NoLinkActivity.EXTRA_RETRY_URL, cached)
+                }
+            }
+            LastCourse.Unset -> when {
+                // Attributed Non-organic user without a URL yet:
+                // never white. Show NoLink so they can Retry once
+                // connectivity comes back, and if by chance we DO
+                // have a cached URL, hand it over for the resume.
+                nonOrg -> Intent(this, NoLinkActivity::class.java).apply {
                     if (cached.isNotEmpty()) {
                         putExtra(NoLinkActivity.EXTRA_RETRY_URL, cached)
                     }
+                }
+                // Organic default: no evidence the user was ever
+                // meant for the gray flow. Send them into the native
+                // game so the offline relaunch is not blocked by a
+                // NoLink screen.
+                cached.isEmpty() -> Intent(this, MainMenuActivity::class.java)
+                else -> Intent(this, NoLinkActivity::class.java).apply {
+                    putExtra(NoLinkActivity.EXTRA_RETRY_URL, cached)
                 }
             }
         }
@@ -306,7 +393,15 @@ class LoadingActivity : AppCompatActivity() {
         // Send the AppsFlyer launch event with a REAL Activity host. Passing
         // Application context here queues the event to the next activity
         // transition and the conversion listener never fires in time.
-        LinkPilot.of(this).start(this)
+        val pilot = LinkPilot.of(this)
+        pilot.start(this)
+
+        // Do not launch the pilot while the install-referrer probe is
+        // still in flight (first launch after install). The probe
+        // coroutine kicked off in onCreate owns the dispatch decision
+        // in that window — running the pilot in parallel would reopen
+        // the offline race the probe was added to close.
+        if (!pilot.stowage.referrerProbed) return
 
         launchPilot()
     }
@@ -461,8 +556,46 @@ class LoadingActivity : AppCompatActivity() {
             }
 
             is Berth.LostSignal -> {
-                Log.d(TAG, "dispatch → LostSignal (NoLink)")
-                Intent(this, NoLinkActivity::class.java)
+                // Pilot returned LostSignal even though the carrier
+                // may still be up — e.g. chart POST timed out, DNS
+                // probe failed on a slow-cold-resolver, or a
+                // captive-portal SSL bump broke the request. Three
+                // routes out, in order of user promise:
+                //
+                //   (a) Web-committed OR attributed Non-organic user
+                //       → NoLink (with the last cached URL for retry
+                //       if we have one). Demoting them to the native
+                //       game would silently break the gray promise —
+                //       exactly the field report that led to this
+                //       fix ("gray → time skip → white").
+                //   (b) Truly organic user with a live carrier → the
+                //       native game. Nothing to route to, and
+                //       showing "no wifi" while wifi is on reads as
+                //       broken.
+                //   (c) No carrier → NoLink. The honest UX.
+                val web = pilot.stowage.course == LastCourse.Web
+                val nonOrg = pilot.stowage.attributedNonOrganic
+                val cached = pilot.stowage.cachedDestination().orEmpty()
+                if (web || nonOrg) {
+                    Log.d(
+                        TAG,
+                        "dispatch → LostSignal + " +
+                            (if (web) "course=Web " else "") +
+                            (if (nonOrg) "nonOrganic " else "") +
+                            "→ NoLink (retry)"
+                    )
+                    Intent(this, NoLinkActivity::class.java).apply {
+                        if (cached.isNotEmpty()) {
+                            putExtra(NoLinkActivity.EXTRA_RETRY_URL, cached)
+                        }
+                    }
+                } else if (pilot.auditor.hasCarrier()) {
+                    Log.d(TAG, "dispatch → LostSignal but carrier up (organic) → MainMenu")
+                    Intent(this, MainMenuActivity::class.java)
+                } else {
+                    Log.d(TAG, "dispatch → LostSignal (NoLink)")
+                    Intent(this, NoLinkActivity::class.java)
+                }
             }
         }
         next.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)

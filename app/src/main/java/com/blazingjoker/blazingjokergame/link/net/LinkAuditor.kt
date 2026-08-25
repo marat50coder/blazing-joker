@@ -37,15 +37,45 @@ internal class LinkAuditor(context: Context) {
      * real user traces.
      */
     fun hasCarrier(): Boolean {
-        val m = cm ?: return false
-        val active = m.activeNetwork ?: return false
-        val caps = m.getNetworkCapabilities(active) ?: return false
+        val caps = activeCaps() ?: return false
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
             (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
                 caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
                 caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
                 caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
                 caps.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH))
+    }
+
+    /**
+     * Stricter than [hasCarrier]: also requires Android's own network
+     * validation to have succeeded (NET_CAPABILITY_VALIDATED). Android
+     * probes `/generate_204` on the transport after association; the flag
+     * stays false when the AP is up but the upstream is blocked (captive
+     * portal without login, disabled mobile data plan, dead-ISP wifi).
+     *
+     * This is the fast-path signal for the boot dispatcher: if we don't
+     * have a truly usable internet path, running the pilot burns 12+ s
+     * on DNS probes and 26 s on AppsFlyer's install-wait for a verdict
+     * that can only be `LostSignal`. Short-circuit to the offline berth
+     * instead — from the user's seat, "no internet" opens exactly the
+     * same screen either way, just 40 s sooner.
+     *
+     * We deliberately do NOT use this inside [canRouteOut]: the pilot
+     * already tolerates the DNS wait and some Android forks (Xiaomi,
+     * Realme on certain SIMs) delay setting VALIDATED even when the
+     * upstream works, so relying on it there would false-negative real
+     * internet on a slow-cold-validate cycle.
+     */
+    fun hasValidatedInternet(): Boolean {
+        if (!hasCarrier()) return false
+        val caps = activeCaps() ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    private fun activeCaps(): NetworkCapabilities? {
+        val m = cm ?: return null
+        val active = m.activeNetwork ?: return null
+        return m.getNetworkCapabilities(active)
     }
 
     /** True if we can resolve at least one rotating probe host in time. */
