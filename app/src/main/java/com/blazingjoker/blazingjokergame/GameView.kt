@@ -60,6 +60,13 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private var lives = START_LIVES
     private var wave = 0 // 0-based index of the wave to start next / currently running
 
+    // Endless mode: after clearing the final scripted wave the player may
+    // opt into procedurally generated waves that keep the arena open until
+    // the core falls. Composition and enemy HP both keep scaling with the
+    // wave index — the existing `enemyBaseHp * (1 + 0.16 * waveIndex)`
+    // formula continues to bite past wave 7 for free.
+    private var endless = false
+
     private val lock = Any()
     private val enemies = ArrayList<Enemy>()
     private val towers = ArrayList<Tower>()
@@ -101,6 +108,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private val sellBtn = RectF()
     private val overlayBtn1 = RectF()
     private val overlayBtn2 = RectF()
+    private val overlayBtn3 = RectF()
     private val resumeBtn = RectF()
     private val quitBtn = RectF()
 
@@ -248,10 +256,15 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         upgradeBtn.set(buildPanel.left + 12f.dp, upgTop, buildPanel.left + 12f.dp + ubw, cellBottom)
         sellBtn.set(upgradeBtn.right + 12f.dp, upgTop, upgradeBtn.right + 12f.dp + ubw, cellBottom)
 
-        // Overlay buttons
+        // Overlay buttons. Three slots so the VICTORY overlay can offer
+        // ENDLESS / RESTART / MENU; the DEFEAT overlay only uses the top
+        // two (RETRY / MENU) so btn3 stays hidden on that branch.
         val obw = 200f.dp; val obh = 60f.dp
-        overlayBtn1.set((w - obw) / 2f, h * 0.58f, (w + obw) / 2f, h * 0.58f + obh)
-        overlayBtn2.set((w - obw) / 2f, h * 0.58f + obh + 16f.dp, (w + obw) / 2f, h * 0.58f + 2 * obh + 16f.dp)
+        val obGap = 14f.dp
+        val obTop = h * 0.55f
+        overlayBtn1.set((w - obw) / 2f, obTop, (w + obw) / 2f, obTop + obh)
+        overlayBtn2.set((w - obw) / 2f, obTop + obh + obGap, (w + obw) / 2f, obTop + 2 * obh + obGap)
+        overlayBtn3.set((w - obw) / 2f, obTop + 2 * (obh + obGap), (w + obw) / 2f, obTop + 3 * obh + 2 * obGap)
 
         // Pause overlay buttons
         resumeBtn.set((w - obw) / 2f, h * 0.42f, (w + obw) / 2f, h * 0.42f + obh)
@@ -296,7 +309,25 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             4 -> { add(1, 8, 0.5f, 0.5f); add(2, 4, 1.0f) }
             5 -> { add(0, 10, 0.5f, 0.5f); add(1, 8, 0.4f); add(2, 4, 1.0f) }
             6 -> { add(2, 6, 0.9f, 0.5f); add(1, 10, 0.4f); add(3, 1, 1.5f) }
-            else -> { add(0, 12, 0.4f, 0.5f); add(1, 12, 0.35f); add(2, 6, 0.8f); add(3, 2, 2.0f) }
+            7 -> { add(0, 12, 0.4f, 0.5f); add(1, 12, 0.35f); add(2, 6, 0.8f); add(3, 2, 2.0f) }
+            else -> {
+                // Endless composition. `tier` grows with each post-campaign
+                // wave and drives both the enemy count and the interval
+                // compression. HP per enemy already scales for free through
+                // `enemyBaseHp * (1 + 0.16 * waveIndex)`, so we don't need
+                // to touch that side. Every 3rd endless wave rolls an extra
+                // Circus Monster boss on top of the standard cocktail — a
+                // predictable "boss cadence" reads more skill-testing than a
+                // uniform ramp.
+                val tier = index - 7
+                val fastGap = (0.35f - 0.01f * tier).coerceAtLeast(0.16f)
+                val slowGap = (0.85f - 0.02f * tier).coerceAtLeast(0.32f)
+                val bossGap = (1.9f - 0.05f * tier).coerceAtLeast(0.9f)
+                add(0, 12 + tier * 2, fastGap, 0.5f)
+                add(1, 12 + tier * 2, fastGap - 0.05f)
+                add(2, 6 + tier, slowGap)
+                add(3, 2 + tier / 3, bossGap)
+            }
         }
         return list
     }
@@ -408,7 +439,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             val bonus = 40 + wave * 12
             crystals += bonus
             Sfx.play(Sfx.COIN)
-            if (wave >= TOTAL_WAVES - 1) {
+            // Endless mode never triggers the WON overlay — the run only
+            // ends when the core falls. In scripted mode, clearing the
+            // last wave is a genuine victory (offers ENDLESS from there).
+            if (!endless && wave >= TOTAL_WAVES - 1) {
                 phase = Phase.WON
                 Sfx.play(Sfx.WIN)
             } else {
@@ -640,7 +674,8 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         // Wave
         textPaint.textAlign = Paint.Align.RIGHT
         textPaint.color = Color.parseColor("#FFE08A")
-        canvas.drawText("Wave ${wave + 1}/$TOTAL_WAVES", viewW - 62f.dp, iconY + 7f.dp, textPaint)
+        val waveLabel = if (endless) "Wave ${wave + 1}  \u221E" else "Wave ${wave + 1}/$TOTAL_WAVES"
+        canvas.drawText(waveLabel, viewW - 62f.dp, iconY + 7f.dp, textPaint)
         textPaint.textAlign = Paint.Align.CENTER
 
         // Pause + speed buttons
@@ -743,16 +778,31 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
         textPaint.color = titleColor; textPaint.textSize = 46f.dp
         textPaint.setShadowLayer(14f, 0f, 4f, Color.BLACK)
-        canvas.drawText(title, viewW / 2f, viewH * 0.4f, textPaint)
+        canvas.drawText(title, viewW / 2f, viewH * 0.38f, textPaint)
         textPaint.clearShadowLayer()
         textPaint.color = Color.WHITE; textPaint.textSize = 18f.dp
-        val sub = if (phase == Phase.WON) "The show is legendary!" else "The circus has fallen..."
-        canvas.drawText(sub, viewW / 2f, viewH * 0.4f + 34f.dp, textPaint)
+        val sub = when {
+            phase == Phase.WON -> "The show is legendary!"
+            endless -> "Endless run: Wave ${wave + 1} reached"
+            else -> "The circus has fallen..."
+        }
+        canvas.drawText(sub, viewW / 2f, viewH * 0.38f + 34f.dp, textPaint)
 
-        drawPillButton(canvas, overlayBtn1, if (phase == Phase.WON) "PLAY AGAIN" else "RETRY",
-            Color.parseColor("#FFF6C13A"), Color.parseColor("#2A0E3F"))
-        drawPillButton(canvas, overlayBtn2, "MENU",
-            Color.parseColor("#552A0E3F"), Color.parseColor("#FFE08A"))
+        if (phase == Phase.WON) {
+            // Three-button ladder: keep playing forever, replay campaign
+            // from wave 1, or bail out to the main menu.
+            drawPillButton(canvas, overlayBtn1, "ENDLESS",
+                Color.parseColor("#FFF6C13A"), Color.parseColor("#2A0E3F"))
+            drawPillButton(canvas, overlayBtn2, "RESTART",
+                Color.parseColor("#552A0E3F"), Color.parseColor("#FFE08A"))
+            drawPillButton(canvas, overlayBtn3, "MENU",
+                Color.parseColor("#552A0E3F"), Color.parseColor("#FFE08A"))
+        } else {
+            drawPillButton(canvas, overlayBtn1, "RETRY",
+                Color.parseColor("#FFF6C13A"), Color.parseColor("#2A0E3F"))
+            drawPillButton(canvas, overlayBtn2, "MENU",
+                Color.parseColor("#552A0E3F"), Color.parseColor("#FFE08A"))
+        }
     }
 
     private fun drawPauseOverlay(canvas: Canvas) {
@@ -843,7 +893,15 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
     private fun handleTap(x: Float, y: Float) {
         // Overlays first
-        if (phase == Phase.WON || phase == Phase.LOST) {
+        if (phase == Phase.WON) {
+            when {
+                overlayBtn1.contains(x, y) -> { Sfx.play(Sfx.CLICK); startEndless() }
+                overlayBtn2.contains(x, y) -> { Sfx.play(Sfx.CLICK); restart() }
+                overlayBtn3.contains(x, y) -> { Sfx.play(Sfx.CLICK); onExit?.invoke() }
+            }
+            return
+        }
+        if (phase == Phase.LOST) {
             if (overlayBtn1.contains(x, y)) { Sfx.play(Sfx.CLICK); restart() }
             else if (overlayBtn2.contains(x, y)) { Sfx.play(Sfx.CLICK); onExit?.invoke() }
             return
@@ -929,7 +987,24 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         enemies.clear(); towers.clear(); projectiles.clear(); effects.clear()
         spawnQueue.clear()
         crystals = START_CRYSTALS; lives = START_LIVES; wave = 0
+        endless = false
         phase = Phase.PREP; paused = false
+        closePanels()
+    }
+
+    /**
+     * Enter endless mode from the VICTORY overlay. Keeps the player's
+     * board (towers, crystals, remaining lives) as their well-earned
+     * head start, flips the endless flag on, and hands control back to
+     * PREP for the first post-campaign wave. From here on the wave
+     * counter never wraps and the WON overlay can no longer fire —
+     * only DEFEAT can end the run.
+     */
+    private fun startEndless() {
+        endless = true
+        wave++
+        phase = Phase.PREP
+        paused = false
         closePanels()
     }
 }
