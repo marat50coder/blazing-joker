@@ -67,6 +67,20 @@ internal class LinkPilot private constructor(
      */
     fun wireUp() {
         runCatching { campaign.wireUp() }
+        // When FCM delivers a token after an offline-first boot, re-POST
+        // the chart body so the backend actually receives `push_token`.
+        // Without this, HornFcmService.onNewToken publishes to
+        // LiveTokenBus and nothing ever forwards it to config.php.
+        if (horn.onTokenRotated == null) {
+            horn.onTokenRotated = { _ ->
+                ambientScope.launch {
+                    runCatching {
+                        val installBag = campaign.awaitInstall(LinkConfig.RETURN_INSTALL_WAIT_MS)
+                        askChart(installBag)
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -137,7 +151,11 @@ internal class LinkPilot private constructor(
      * some vendor forks.
      */
     suspend fun probeInstallReferrer(timeoutMs: Long = 1500L) {
-        if (stowage.referrerProbed) return
+        // Skip only when we've probed AND actually captured a fact map
+        // in persistent storage. An older build that probed but discarded
+        // the payload leaves `referrerProbed=true` with empty facts — we
+        // need to re-probe once so `askChart` has real values to merge.
+        if (stowage.referrerProbed && stowage.installReferrerFacts.isNotEmpty()) return
         val facts = withTimeoutOrNull(timeoutMs) { referrer.probe() }
         // Regardless of outcome (found / empty / service unavailable),
         // record that we tried. A permanent failure to reach Play Store
@@ -147,12 +165,52 @@ internal class LinkPilot private constructor(
             Log.d(TAG, "probeInstallReferrer: no referrer facts")
             return
         }
+        // Persist so future launches (which skip the IPC) still have
+        // pid / campaign / af_sub* / af_c_id / deep_link_value to merge
+        // into the `config.php` POST body.
+        stowage.installReferrerFacts = facts
         Log.d(TAG, "probeInstallReferrer: facts keys=${facts.keys}")
         if (hasMarketingHardSignal(facts)) {
             if (!stowage.attributedNonOrganic) {
                 Log.i(TAG, "probeInstallReferrer: marketing signal in referrer → latching attributedNonOrganic=true")
                 stowage.attributedNonOrganic = true
             }
+            return
+        }
+        // Play Store's authoritative "no attributed click" signature.
+        // The install-referrer service reports `utm_source=google-play&
+        // utm_medium=organic` (with no marketing keys at all) EXACTLY
+        // when the user reached the Play listing without going through
+        // a tracked OneLink click. Because this signal comes from Play
+        // itself over local binder IPC — not from AppsFlyer — it is
+        // reliable even offline and cannot be spoofed by AF's OneLink
+        // template defaults (which happily deliver placeholder
+        // `deep_link_value=deep_link_test` in the deep-link callback
+        // on every debug install and would otherwise latch the device
+        // as non-organic here).
+        //
+        // Latching organic + committing course=Native here does two
+        // things at once:
+        //   1. `chart()`'s early `if (stowage.attributedOrganic)` gate
+        //      returns Berth.Native before touching any carrier / route
+        //      / AppsFlyer wait, so the white game opens fully offline
+        //      on this AND every subsequent launch.
+        //   2. `LoadingActivity`'s fast-path `course==Native` fires on
+        //      the next cold launch and skips the pilot entirely — the
+        //      white part never again asks for internet.
+        val utmMedium = facts["utm_medium"]?.lowercase().orEmpty()
+        val utmSource = facts["utm_source"]?.lowercase().orEmpty()
+        val organicReferrer = utmMedium == "organic" ||
+            (utmSource == "google-play" && utmMedium.isEmpty())
+        if (organicReferrer && !stowage.attributedNonOrganic) {
+            Log.i(
+                TAG,
+                "probeInstallReferrer: Play-authoritative organic signature " +
+                    "(utm_source=$utmSource, utm_medium=$utmMedium) → " +
+                    "latching attributedOrganic + course=Native"
+            )
+            stowage.attributedOrganic = true
+            stowage.course = LastCourse.Native
         }
     }
 
@@ -230,7 +288,8 @@ internal class LinkPilot private constructor(
         val hardSignalOnLaunch = hasMarketingHardSignal(campaign.deepLinkFacts()) ||
             hasMarketingHardSignal(campaign.uriFacts()) ||
             campaign.wasUriLaunched() ||
-            hasMarketingHardSignal(installBag)
+            hasMarketingHardSignal(installBag) ||
+            hasMarketingHardSignal(stowage.installReferrerFacts.mapValues { it.value as Any? })
         if (hardSignalOnLaunch && !stowage.attributedNonOrganic) {
             Log.i(TAG, "decideFresh: latching attributedNonOrganic=true")
             stowage.attributedNonOrganic = true
@@ -411,7 +470,8 @@ internal class LinkPilot private constructor(
         val hardSignalOnLaunch = hasMarketingHardSignal(campaign.deepLinkFacts()) ||
             hasMarketingHardSignal(campaign.uriFacts()) ||
             campaign.wasUriLaunched() ||
-            hasMarketingHardSignal(installBag)
+            hasMarketingHardSignal(installBag) ||
+            hasMarketingHardSignal(stowage.installReferrerFacts.mapValues { it.value as Any? })
         if (hardSignalOnLaunch && !stowage.attributedNonOrganic) {
             Log.i(TAG, "decideReturningNative: latching attributedNonOrganic=true")
             stowage.attributedNonOrganic = true
@@ -440,12 +500,33 @@ internal class LinkPilot private constructor(
     private suspend fun askChart(installBag: Map<String, Any?>): ChartAnswer {
         val body = JSONObject()
 
-        // Merge priority: real SDK attribution wins over URI query params
-        // wins over deep-link callback facts. This matches AppsFlyer's own
-        // recommendation and the backend's expected precedence.
-        installBag.forEach { (k, v) -> if (v != null) body.put(k, v) }
-        campaign.uriFacts().forEach { (k, v) -> if (!body.has(k) && v != null) body.put(k, v) }
-        campaign.deepLinkFacts().forEach { (k, v) -> if (!body.has(k) && v != null) body.put(k, v) }
+        // Merge priority (best signal first). Semantics: only put a key
+        // when body has no NON-EMPTY value there yet, and only when the
+        // incoming value is itself non-empty. This lets a later source
+        // (referrer) fill in slots that an earlier source (e.g. AF's
+        // deep-link callback) left as literal empty strings — which is
+        // exactly the failure mode config.php saw on a fresh OneLink
+        // install: AF replied `{af_status:Organic, af_message, is_first_launch}`
+        // AND the deep-link resolver stubbed every af_sub*/campaign/
+        // media_source as `""`, so the real values from Google Play's
+        // install referrer never reached the backend.
+        //
+        //   1. installBag         — SDK conversion payload (authoritative
+        //                            for af_status/af_message).
+        //   2. campaign.uriFacts  — live VIEW-intent OneLink query params.
+        //   3. installReferrer    — Play Store IPC (offline-safe truth
+        //                            for the ORIGINAL click that produced
+        //                            this install).
+        //   4. deepLinkFacts      — AF's deep-link callback (frequently
+        //                            arrives with empty stub values).
+        //
+        // The `pid`/`c`/`af_c_id` short names from the referrer are
+        // mirrored to their long aliases (`media_source`/`campaign`/
+        // `campaign_id`) so the backend can key off either shape.
+        mergeFactsInto(body, installBag)
+        mergeFactsInto(body, campaign.uriFacts())
+        mergeFactsInto(body, stowage.installReferrerFacts.mapValues { it.value as Any? })
+        mergeFactsInto(body, campaign.deepLinkFacts())
 
         // ── af_status resolution ────────────────────────────────────
         // The backend rejects bodies without an af_status ("No data").
@@ -453,7 +534,8 @@ internal class LinkPilot private constructor(
         // AppsFlyer's conversion callback frequently mis-reports Organic
         // on a fresh install even when we have hard evidence of a tracked
         // entry: the OneLink resolver returned pid/campaign/af_sub*, or
-        // the app was launched via a VIEW intent carrying the OneLink URL.
+        // the app was launched via a VIEW intent carrying the OneLink URL,
+        // or the Play Store install referrer already carried the click.
         // This "organic rescue" overrides that: if any hard signal fired,
         // we upgrade the status to Non-organic before hitting config.php.
         //
@@ -462,8 +544,10 @@ internal class LinkPilot private constructor(
         //     containing media_source / campaign / af_c_id / af_sub1-5 /
         //     deep_link_value with a real value.
         //   * The launch URI carried the same fields as query params.
+        //   * The Play Store install referrer already carried the click.
         val hardSignal = hasMarketingHardSignal(campaign.deepLinkFacts()) ||
-            hasMarketingHardSignal(campaign.uriFacts())
+            hasMarketingHardSignal(campaign.uriFacts()) ||
+            hasMarketingHardSignal(stowage.installReferrerFacts.mapValues { it.value as Any? })
         val reported = body.optString("af_status").takeIf { it.isNotEmpty() }
         val effective = when {
             hardSignal -> "Non-organic"
@@ -494,6 +578,36 @@ internal class LinkPilot private constructor(
     }
 
     /**
+     * Merge one source of attribution facts into the outgoing JSON body
+     * with "keep first non-empty value" semantics. Empty strings and the
+     * literal token `"null"` are treated as absent both when reading
+     * (they never overwrite existing data) and when writing (we don't
+     * put them into the body in the first place).
+     *
+     * OneLink short-name keys (`pid`, `c`, `af_c_id`, `af_channel`,
+     * `af_adset`, `siteid`) are additionally mirrored to their SDK
+     * long-name aliases (`media_source`, `campaign`, `campaign_id`,
+     * `channel`, `adset`, `af_siteid`) so the backend receives both
+     * shapes regardless of which source populated the field.
+     */
+    private fun mergeFactsInto(body: JSONObject, facts: Map<String, Any?>) {
+        if (facts.isEmpty()) return
+        for ((key, raw) in facts) {
+            if (key.isNullOrBlank()) continue
+            val str = raw?.toString().orEmpty()
+            if (str.isEmpty() || str.equals("null", ignoreCase = true)) continue
+            putIfEmpty(body, key, str)
+            KEY_ALIAS[key]?.let { alias -> putIfEmpty(body, alias, str) }
+        }
+    }
+
+    private fun putIfEmpty(body: JSONObject, key: String, value: String) {
+        val existing = body.opt(key)?.toString().orEmpty()
+        if (existing.isNotEmpty() && !existing.equals("null", ignoreCase = true)) return
+        body.put(key, value)
+    }
+
+    /**
      * True if the map carries a non-empty value in ANY of the fields that
      * AppsFlyer only fills when a real tracked click landed. Presence of
      * even one is enough to declare the install non-organic.
@@ -506,14 +620,37 @@ internal class LinkPilot private constructor(
      * while the deep-link fields already carry the real click payload.
      * Filtering them out here regressed real OneLink taps into the
      * native flow on the tester's release build, so they stay in.
-     * Placeholder-style default values ("deep_link_test") should be
-     * cleaned up in the AppsFlyer OneLink template, not filtered here.
+     *
+     * BUT: AppsFlyer ships the OneLink template with debug placeholders
+     * (`deep_link_value=deep_link_test`, `deep_link_sub1=deep_test_sub1`)
+     * that its deep-link resolver delivers on EVERY install regardless
+     * of whether a real click landed. Those values are treated as
+     * absent here so a fully organic install (per Play referrer) is
+     * not misclassified as non-organic just because AF replayed the
+     * template defaults.
      */
     private fun hasMarketingHardSignal(facts: Map<String, Any?>): Boolean {
         if (facts.isEmpty()) return false
         return MARKETING_HARD_SIGNAL_KEYS.any { key ->
             val v = facts[key]?.toString().orEmpty()
-            v.isNotEmpty() && !v.equals("null", ignoreCase = true)
+            v.isNotEmpty() &&
+                !v.equals("null", ignoreCase = true) &&
+                !isPlaceholderValue(key, v)
+        }
+    }
+
+    /**
+     * AppsFlyer's default OneLink template ships with hard-coded
+     * placeholder values that its deep-link resolver echoes back on
+     * every install (even organic). We drop them from the hard-signal
+     * calculus so an organic install per Play referrer is not flipped
+     * into the gray flow purely by SDK boilerplate.
+     */
+    private fun isPlaceholderValue(key: String, value: String): Boolean {
+        return when (key) {
+            "deep_link_value" -> value.equals("deep_link_test", ignoreCase = true)
+            "deep_link_sub1" -> value.equals("deep_test_sub1", ignoreCase = true)
+            else -> false
         }
     }
 
@@ -548,6 +685,24 @@ internal class LinkPilot private constructor(
             "deep_link_value", "deep_link_sub1",
             "agency",
             "af_prt", "af_keywords",
+        )
+
+        // OneLink short-param → conversion-callback long-name mirror.
+        // Kept in sync with CampaignBroker.URL_ALIAS; duplicated here so
+        // askChart can expand aliases coming from the install-referrer
+        // map (which carries the SHORT names — `pid`, `c`, `af_c_id`).
+        private val KEY_ALIAS = mapOf(
+            "pid" to "media_source",
+            "c" to "campaign",
+            "af_c_id" to "campaign_id",
+            "af_channel" to "channel",
+            "af_ad" to "ad",
+            "af_ad_id" to "ad_id",
+            "af_adset_id" to "adset_id",
+            "af_adset" to "adset",
+            "af_ad_type" to "ad_type",
+            "af_keywords" to "keywords",
+            "siteid" to "af_siteid",
         )
 
         @Volatile

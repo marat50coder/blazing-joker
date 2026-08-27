@@ -68,6 +68,12 @@ class LoadingActivity : AppCompatActivity() {
     private val loaderScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var chartJob: Job? = null
 
+    // Hold the Android 12+ system splash until the first-launch
+    // referrer probe finishes so we can jump straight to NoLink
+    // without painting the branded loading art first.
+    @Volatile
+    private var holdSystemSplash = false
+
     // Progress bar has three phases: base warm-up (0 -> ~0.15), pilot-driven
     // (~0.15 -> 0.95), then final flush before dispatch (0.95 -> 1.0). This
     // keeps the bar visibly alive even when the pilot resolves quickly.
@@ -84,7 +90,8 @@ class LoadingActivity : AppCompatActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        installSplashScreen()
+        val splash = installSplashScreen()
+        splash.setKeepOnScreenCondition { holdSystemSplash }
         super.onCreate(savedInstanceState)
         Ui.immersive(this)
 
@@ -137,11 +144,15 @@ class LoadingActivity : AppCompatActivity() {
         // this cost once per install.
         if (!pilot.stowage.referrerProbed) {
             Log.d(TAG, "first launch: probing install referrer before dispatch")
-            buildScreen()
+            // Keep the system splash up — do NOT paint the branded
+            // loading art yet. After the probe we know whether this
+            // install is gray+offline (jump to NoLink with no bar) or
+            // white / online (then we build the branded splash).
+            holdSystemSplash = true
             pilot.kickOffAmbient()
             loaderScope.launch {
                 withContext(Dispatchers.IO) { pilot.probeInstallReferrer() }
-                decideAfterProbe(pilot, coldUrl)
+                decideAfterProbe()
             }
             return
         }
@@ -152,13 +163,35 @@ class LoadingActivity : AppCompatActivity() {
         // game itself has no network dependency, so making it wait on
         // attribution + chart POST just to potentially discover a Web
         // upgrade is what triggered the "second launch of the white
-        // part needs internet" report. Skip the pilot entirely.
+        // part needs internet" report.
+        //
+        // We still show the branded loading splash for ~1 s here so
+        // the user never sees "app opens straight into the menu"
+        // (which the tester reported as "loading screen disappeared
+        // after the first launch"). Two shapes:
+        //   * `attributedOrganic` latched → let the pilot run.
+        //     [LinkPilot.chart] short-circuits to `Berth.Native` at
+        //     the top with `onProgress(1f)` in <10 ms via the organic
+        //     latch, so the pilot's own progress-bar animation plays
+        //     out with zero network dependency.
+        //   * organic latch NOT set (course=Native came from a prior
+        //     server no-url reply, not from the referrer probe) →
+        //     running the pilot would still block on decideReturningNative's
+        //     awaitInstall. Show the splash on a timer and dispatch
+        //     via [skipToOfflineBerth] as before.
         if (LinkConfig.credentialsReady &&
             coldUrl.isEmpty() &&
             pilot.stowage.course == LastCourse.Native
         ) {
-            Log.d(TAG, "fast-path: course=Native → MainMenu without pilot")
-            skipToOfflineBerth(pilot)
+            if (pilot.stowage.attributedOrganic) {
+                Log.d(TAG, "fast-path: course=Native + organic latch → pilot for splash")
+                buildScreen()
+                pilot.kickOffAmbient()
+                return
+            }
+            Log.d(TAG, "fast-path: course=Native → MainMenu with visible splash")
+            buildScreen()
+            scheduleSplashThen { if (!isFinishing) skipToOfflineBerth(pilot) }
             return
         }
 
@@ -173,12 +206,27 @@ class LoadingActivity : AppCompatActivity() {
         // LostSignal — the user just saw ~40 s of white loading for
         // nothing. From their seat, opening straight to the offline
         // berth reads the same but 40 s sooner.
+        //
+        // We DO NOT show the ~1 s loading splash when the offline berth
+        // is going to route to the NoLink retry screen (gray user with
+        // course=Web / course=Unset + non-organic latch): the tester
+        // report calls out "loading progress appears then jumps to no-
+        // wifi" as broken UX — they expect the no-wifi screen to appear
+        // instantly the moment the app opens without a connection. The
+        // splash stays only for the "would land on MainMenu" case (the
+        // white game, whose loading transition is part of its own UX).
         if (LinkConfig.credentialsReady &&
             coldUrl.isEmpty() &&
             !pilot.auditor.hasValidatedInternet()
         ) {
-            Log.d(TAG, "fast-path: no validated internet → offline berth without pilot")
-            skipToOfflineBerth(pilot)
+            if (offlineDispatchIsMainMenu(pilot)) {
+                Log.d(TAG, "fast-path: no internet → MainMenu with visible splash")
+                buildScreen()
+                scheduleSplashThen { if (!isFinishing) skipToOfflineBerth(pilot) }
+            } else {
+                Log.d(TAG, "fast-path: no internet → NoLink instantly (no splash)")
+                skipToOfflineBerth(pilot)
+            }
             return
         }
 
@@ -187,35 +235,70 @@ class LoadingActivity : AppCompatActivity() {
     }
 
     /**
-     * Post-probe branch: the install-referrer probe has finished (or
-     * timed out) and any offline-detectable marketing signal has been
-     * latched into `attributedNonOrganic`. From here the same fast-path
-     * ladder as [onCreate] applies — the ONLY difference is that the
-     * offline branch now knows the user is non-organic and routes to
-     * NoLink (retry) instead of the white game.
+     * Mirrors the routing decision inside [skipToOfflineBerth]: returns
+     * true when that method would open [MainMenuActivity], false when
+     * it would open [NoLinkActivity]. Kept in sync with the `when`
+     * ladder below.
      */
-    private fun decideAfterProbe(pilot: LinkPilot, coldUrl: String) {
-        if (isFinishing) return
-
-        if (LinkConfig.credentialsReady &&
-            coldUrl.isEmpty() &&
-            pilot.stowage.course == LastCourse.Native
-        ) {
-            Log.d(TAG, "post-probe fast-path: course=Native → MainMenu")
-            skipToOfflineBerth(pilot)
-            return
+    private fun offlineDispatchIsMainMenu(pilot: LinkPilot): Boolean {
+        val course = pilot.stowage.course
+        val nonOrg = pilot.stowage.attributedNonOrganic
+        val cached = pilot.stowage.cachedDestination().orEmpty().isNotEmpty()
+        return when (course) {
+            LastCourse.Native -> true
+            LastCourse.Web -> false
+            LastCourse.Unset -> !nonOrg && !cached
         }
+    }
+
+    /**
+     * Drive the loading bar to 100 % over ~1 s and then invoke [action].
+     * Used by the offline / already-committed fast paths so the user
+     * always sees the splash even when we skip the pilot pipeline.
+     */
+    private fun scheduleSplashThen(action: () -> Unit) {
+        driveBarTo(0.55f, 620L)
+        uiHandler.postDelayed({
+            driveBarTo(1f, 380L)
+            uiHandler.postDelayed({ action() }, 260L)
+        }, 680L)
+    }
+
+    /**
+     * Post-probe branch: the install-referrer probe has finished (or
+     * timed out) and any offline-detectable attribution has been
+     * latched. The branded loading screen was NOT built yet — we only
+     * paint it when the destination is the native game or when we
+     * actually have internet and the pilot will run.
+     *
+     * Gray + no internet → NoLink immediately (no progress bar).
+     * White + no internet → branded splash, then MainMenu.
+     * Anything online → branded splash + full pilot.
+     */
+    private fun decideAfterProbe() {
+        if (isFinishing) return
+        val pilot = LinkPilot.of(this)
+        val coldUrl = extractPushUrl(intent)
 
         if (LinkConfig.credentialsReady &&
             coldUrl.isEmpty() &&
             !pilot.auditor.hasValidatedInternet()
         ) {
-            Log.d(TAG, "post-probe: no validated internet → offline berth")
-            skipToOfflineBerth(pilot)
+            if (offlineDispatchIsMainMenu(pilot)) {
+                Log.d(TAG, "post-probe: no internet → MainMenu with visible splash")
+                holdSystemSplash = false
+                buildScreen()
+                scheduleSplashThen { if (!isFinishing) skipToOfflineBerth(pilot) }
+            } else {
+                Log.d(TAG, "post-probe: no internet → NoLink instantly (no splash)")
+                skipToOfflineBerth(pilot)
+            }
             return
         }
 
-        // Online: run the pilot as usual.
+        holdSystemSplash = false
+        buildScreen()
+        pilot.kickOffAmbient()
         launchPilot()
     }
 
@@ -232,6 +315,7 @@ class LoadingActivity : AppCompatActivity() {
      *   Unset + cache   → NoLink (there is a pending Web URL to resume to)
      */
     private fun skipToOfflineBerth(pilot: LinkPilot) {
+        holdSystemSplash = false
         val cached = pilot.stowage.cachedDestination().orEmpty()
         val nonOrg = pilot.stowage.attributedNonOrganic
         Log.d(
@@ -383,18 +467,14 @@ class LoadingActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         Ui.immersive(this)
-        // The fast path in onCreate finishes without building the screen,
-        // so the lateinit UI vars are empty. Guard everything that touches
-        // them and skip the pilot — it's already off to another Activity.
+        val pilot = LinkPilot.of(this)
+        // AppsFlyer launch must be hosted by a real Activity even while
+        // the first-launch referrer probe is still holding the system
+        // splash (no branded UI yet).
+        if (!isFinishing) pilot.start(this)
         if (isFinishing || !::progressBar.isInitialized) return
 
         uiHandler.post(dotRunnable)
-
-        // Send the AppsFlyer launch event with a REAL Activity host. Passing
-        // Application context here queues the event to the next activity
-        // transition and the conversion listener never fires in time.
-        val pilot = LinkPilot.of(this)
-        pilot.start(this)
 
         // Do not launch the pilot while the install-referrer probe is
         // still in flight (first launch after install). The probe
@@ -432,6 +512,16 @@ class LoadingActivity : AppCompatActivity() {
                     // Post to UI thread — animator is UI-only.
                     uiHandler.post { driveBarTo(pilotProgress, 380L) }
                 }
+            }
+
+            // Instant NoLink: if the pilot already knows we have no
+            // usable internet, do not animate the bar to 100 % and
+            // wait 260 ms — that is the "loading completes then no
+            // wifi" flash the tester reported.
+            val pilot = LinkPilot.of(this@LoadingActivity)
+            if (berth is Berth.LostSignal && !pilot.auditor.hasValidatedInternet()) {
+                dispatch(berth)
+                return@launch
             }
 
             // Final flush — bar to 100% right before dispatch. This is the
@@ -613,6 +703,7 @@ class LoadingActivity : AppCompatActivity() {
         // the conventional names sending tools use for the deep-link URL.
         private val FCM_URL_KEYS = arrayOf(
             "url", "link", "deeplink", "deep_link", "target_url", "web_url",
+            "target", "landing",
         )
     }
 }

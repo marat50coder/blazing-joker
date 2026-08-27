@@ -13,17 +13,22 @@ import com.google.firebase.FirebaseApp
  * Responsibilities:
  *   1. Warm [GamePrefs] so on-device settings are ready before the very
  *      first Activity queries them (Sfx reads this in a static init).
- *   2. Bootstrap the native-flow analytics stack — Firebase Analytics
- *      and AppsFlyer — on EVERY launch through [Analytics.bootstrap],
- *      independent of the gray-flow credentials gate.
- *   3. Prime the gray-flow subsystem: initialise [FirebaseApp] before
+ *   2. Prime the gray-flow subsystem: initialise [FirebaseApp] before
  *      any FCM payload arrives, create the notification channel so the
  *      very first push after install can render a tray entry, and wire
- *      the AppsFlyer conversion listeners (via [LinkPilot.wireUp]) so
- *      the SDK sees the first `onResume` even without a live Activity.
+ *      the AppsFlyer conversion + deep-link listeners via
+ *      [LinkPilot.wireUp] so the SDK sees the first `onResume` with the
+ *      REAL listener in place.
+ *   3. Bootstrap Firebase Analytics + consent state through
+ *      [Analytics.bootstrap]. It intentionally does NOT touch AppsFlyer
+ *      — see the doc-comment on that method for the rationale.
  *
- * The two AppsFlyer inits from Analytics.bootstrap and LinkPilot.wireUp
- * collapse to a single SDK singleton — there is no double-reporting.
+ * Order matters: LinkPilot.wireUp MUST run before Analytics.bootstrap.
+ * Otherwise Analytics would call `AppsFlyerLib.start` with the
+ * Application context, anchor the SDK to a "no live Activity" state,
+ * and the real conversion listener registered by CampaignBroker later
+ * would silently never fire — every attribution POST would go out with
+ * empty af_sub* fields.
  */
 class BlazingJokerApp : Application() {
 
@@ -37,12 +42,7 @@ class BlazingJokerApp : Application() {
         }
         runCatching { HornService.ensureChannel(this) }
 
-        // Order matters: Analytics.bootstrap installs a no-op AppsFlyer
-        // conversion listener; LinkPilot.wireUp then re-inits AppsFlyer
-        // with the real gray-flow listener that drives attribution.
-        // Reversing this order would leave the gray-flow with a noop
-        // listener and break OneLink routing.
-        Analytics.bootstrap(this)
         runCatching { LinkPilot.of(this).wireUp() }
+        Analytics.bootstrap(this)
     }
 }

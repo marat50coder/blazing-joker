@@ -28,7 +28,7 @@ import com.blazingjoker.blazingjokergame.link.config.LinkConfig
 /**
  * Push opt-in promo. Shown before the WebCanvas on FRESH gray-flow
  * routings and again whenever the Skip snooze
- * ([LinkConfig.OPT_IN_SNOOZE_SECONDS], 2 d 20 h) elapses. An OS-level
+ * ([LinkConfig.OPT_IN_SNOOZE_SECONDS], ~3 days) elapses. An OS-level
  * "Don't allow" tap is a permanent hard block — the screen never
  * reappears after that. A user who later flips notifications back on
  * from system settings is picked up by
@@ -50,18 +50,13 @@ class AlertOptInActivity : AppCompatActivity() {
     ) { granted ->
         val pilot = LinkPilot.of(this)
         pilot.stowage.markOptInGranted(granted)
-        if (!granted) {
-            // The user has actively refused the OS dialog. Treat that as
-            // the final answer — no snooze-then-reappear loop. Two field
-            // reports before this fix ("after denying I still get the
-            // screen every 3 days") map exactly to the old "snooze on
-            // first deny, hard-block only on the auto-deny second call"
-            // rule. Any real OS "Don't allow" tap now hard-blocks
-            // immediately; the OS switch in system settings remains the
-            // path back to notifications for a user who changes their
-            // mind, mirroring foollegends' single-deny policy.
-            pilot.stowage.markOptInHardBlocked()
-        }
+            if (!granted) {
+                // SkyLadder NudgeScene: a refused OS dialog snoozes
+                // the branded promo. Hard-block stays for a second
+                // "Don't allow" so the screen cannot loop.
+                pilot.stowage.snoozeOptIn(LinkConfig.OPT_IN_SNOOZE_SECONDS)
+                pilot.stowage.markOptInHardBlocked()
+            }
         forward()
     }
 
@@ -205,9 +200,9 @@ class AlertOptInActivity : AppCompatActivity() {
 
     private fun onSkip() {
         // Skip is a SOFT refusal — snooze for
-        // [LinkConfig.OPT_IN_SNOOZE_SECONDS] (2 d 20 h) and the screen
-        // reappears after that window. A real OS "Don't allow" tap
-        // (handled in [permissionAsk]) is the hard-block path.
+        // [LinkConfig.OPT_IN_SNOOZE_SECONDS] (~3 days) and the screen
+        // reappears after that window. Do NOT request the OS permission
+        // here: Skip means "not now", not "ask the system dialog".
         LinkPilot.of(this).stowage.snoozeOptIn(LinkConfig.OPT_IN_SNOOZE_SECONDS)
         forward()
     }

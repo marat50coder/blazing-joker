@@ -8,6 +8,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
@@ -78,6 +79,11 @@ class WebCanvasActivity : AppCompatActivity() {
     // navigations resolve behind the page the user is already reading.
     private var chainSettled = false
 
+    // The affiliate entry chain leaves /redirect/N hops in WebView
+    // history. After the first real page commits we wipe that so Back
+    // returns to the previous *page*, not a redirect URL.
+    private var entryHistoryCleared = false
+
     // Deepest main-frame URL Chromium was seen driving to, settled or not.
     // Affiliate redirect chains routinely blow past Chromium's 20-hop
     // safety limit; resuming from here keeps the cookies picked up along
@@ -107,32 +113,24 @@ class WebCanvasActivity : AppCompatActivity() {
     private var hasErroredThisLoad = false
     private lateinit var kbd: KbdSlide
     private var carrierWatcher: ConnectivityManager.NetworkCallback? = null
+    private val liveInternetNets = java.util.concurrent.ConcurrentHashMap.newKeySet<Network>()
     private val handler = Handler(Looper.getMainLooper())
     private val dropDebounce = Runnable {
-        // Never drop to NoLink from a spurious network flip. Real drops
-        // reproduce here: (a) `retryPending` clears once the recovery
-        // reload commits — do not surrender during recovery; (b) the
-        // system-level `hasCarrier()` re-check is the source of truth
-        // after the debounce, because `onLost` fires for individual
-        // network handles too (Wi-Fi → cellular hand-off), even when the
-        // device still has connectivity via the other transport.
-        if (retryPending) {
+        // SkyLadder / magma-coins: onLost is the source of truth.
+        // Do NOT re-query ConnectivityManager here — at the moment of
+        // drop the dying network is still reported as active and that
+        // lie used to swallow the NoLink screen. If a real hand-off
+        // brought another internet transport up, onAvailable already
+        // cancelled this runnable and re-populated [liveInternetNets].
+        if (liveInternetNets.isNotEmpty()) {
             android.util.Log.d(
                 "WebCanvasActivity",
-                "dropDebounce: retryPending — skip offline"
+                "dropDebounce: another internet net still tracked — skip"
             )
             return@Runnable
         }
-        val stillOnline = runCatching {
-            LinkPilot.of(this@WebCanvasActivity).auditor.hasCarrier()
-        }.getOrDefault(false)
-        if (stillOnline) {
-            android.util.Log.d(
-                "WebCanvasActivity",
-                "dropDebounce: still have carrier — skip offline"
-            )
-            return@Runnable
-        }
+        retryPending = false
+        android.util.Log.d("WebCanvasActivity", "dropDebounce: all internet nets gone → NoLink")
         forwardToOffline()
     }
     private val coverTimeout = Runnable {
@@ -165,6 +163,9 @@ class WebCanvasActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         PushBus.shellAlive = true
+        // Retry FCM token fetch if the first boot happened offline
+        // (HornService.boot() is a no-op once a token is in hand).
+        runCatching { LinkPilot.of(this).kickOffAmbient() }
 
         // Edge-to-edge so the WebView can extend under the status/nav
         // strips; the safe-area padding below re-establishes a bezel
@@ -377,6 +378,12 @@ class WebCanvasActivity : AppCompatActivity() {
                 entryPointRetried = false
                 retryPending = false
                 hideCover()
+                if (!entryHistoryCleared) {
+                    entryHistoryCleared = true
+                    // post: Chromium has not fully committed the current
+                    // item yet; a sync clearHistory() here is a no-op.
+                    view?.post { view.clearHistory() }
+                }
                 view?.let { LensInjector.installAll(it) }
                 // Install the field-position probe once per document —
                 // idempotent thanks to the `MARK` guard inside the script.
@@ -429,11 +436,6 @@ class WebCanvasActivity : AppCompatActivity() {
 
                 // Chromium's 20-hop safety limit — expected for the
                 // affiliate redirect chain the hosted surface kicks off.
-                // Resume from the deepest hop, NOT from lastMainFrameUrl
-                // (that walks the same hops again and burns the budget on
-                // the identical loop).
-                //   -9    = WebViewClient.ERROR_REDIRECT_LOOP
-                //   -1007 = Chromium's ERR_TOO_MANY_REDIRECTS on some ROMs
                 val loopish = code == ERROR_REDIRECT_LOOP || code == -1007 ||
                     desc.contains("too_many", ignoreCase = true) ||
                     desc.contains("REDIRECT", ignoreCase = true)
@@ -442,28 +444,27 @@ class WebCanvasActivity : AppCompatActivity() {
                     return
                 }
 
-                // Any other main-frame error: try the last page that
-                // actually committed, then surrender to NoLink only if we
-                // never had one.
-                val restoreTo = if (pageReady) lastMainFrameUrl else null
-                if (restoreTo != null) {
-                    retryPending = true
-                    view?.postDelayed({
-                        if (!isFinishing && !isDestroyed) {
-                            runCatching {
-                                view.stopLoading()
-                                view.loadUrl(restoreTo)
-                            }
-                        }
-                    }, RELOAD_GRACE_MS)
+                // SkyLadder BrowserScene._onError: connection errors
+                // (INTERNET_DISCONNECTED / HOST_LOOKUP / NETWORK_CHANGED)
+                // go to the native outage screen immediately. Reloading
+                // the partner page here is what left the user on the
+                // site's own broken "no wifi" chrome.
+                if (isConnectionError(code, desc)) {
+                    android.util.Log.d(
+                        "WebCanvasActivity",
+                        "onReceivedError: connection error code=$code desc=$desc → NoLink"
+                    )
+                    runCatching {
+                        view?.stopLoading()
+                        view?.loadUrl(BLANK)
+                    }
+                    forwardToOffline()
                     return
                 }
 
-                runCatching {
-                    view?.stopLoading()
-                    view?.loadUrl(BLANK)
-                }
-                forwardToOffline()
+                // Any other main-frame error: DNS-probe before surrender
+                // so a single broken asset does not flash NoLink.
+                guardOffline()
             }
 
             override fun onReceivedSslError(
@@ -574,12 +575,12 @@ class WebCanvasActivity : AppCompatActivity() {
         // last page that actually committed instead; the user stays where
         // they were.
         val stillOnline = runCatching {
-            LinkPilot.of(this@WebCanvasActivity).auditor.hasCarrier()
+            LinkPilot.of(this@WebCanvasActivity).auditor.hasValidatedInternet()
         }.getOrDefault(false)
         if (stillOnline) {
             android.util.Log.d(
                 "WebCanvasActivity",
-                "handleRedirectLoop: budget exhausted but carrier still up — " +
+                "handleRedirectLoop: budget exhausted but internet still up — " +
                     "reloading last committed page instead of NoLink"
             )
             val restoreTo = lastMainFrameUrl
@@ -623,15 +624,61 @@ class WebCanvasActivity : AppCompatActivity() {
 
     private fun subscribeCarrierWatch() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-        val req = NetworkRequest.Builder().build()
+        // Same shape as SkyLadder's connectivity_plus stream and
+        // magma-coins WireSensor.pulses: watch EVERY network with
+        // INTERNET capability (not just the default). Turning Wi-Fi
+        // off while leftover cellular is still the "default" used to
+        // fire onAvailable(cellular) on a default-network callback
+        // and cancel the drop. Tracking the set of live internet
+        // nets means we only debounce when the LAST one is gone.
+        val req = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
         val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(
+                network: Network,
+                caps: NetworkCapabilities,
+            ) {
+                val usable = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                if (usable) {
+                    liveInternetNets.add(network)
+                    android.util.Log.d(
+                        "WebCanvasActivity",
+                        "internet net validated $network (live=${liveInternetNets.size})"
+                    )
+                    handler.removeCallbacks(dropDebounce)
+                } else {
+                    liveInternetNets.remove(network)
+                    android.util.Log.d(
+                        "WebCanvasActivity",
+                        "internet net unvalidated $network (live=${liveInternetNets.size})"
+                    )
+                    if (liveInternetNets.isEmpty()) {
+                        handler.removeCallbacks(dropDebounce)
+                        handler.postDelayed(dropDebounce, LinkConfig.LINK_DROP_DEBOUNCE_MS)
+                    }
+                }
+            }
+
             override fun onLost(network: Network) {
+                liveInternetNets.remove(network)
+                android.util.Log.d(
+                    "WebCanvasActivity",
+                    "internet net onLost $network (live=${liveInternetNets.size})"
+                )
+                if (liveInternetNets.isNotEmpty()) {
+                    handler.removeCallbacks(dropDebounce)
+                    return
+                }
                 handler.removeCallbacks(dropDebounce)
                 handler.postDelayed(dropDebounce, LinkConfig.LINK_DROP_DEBOUNCE_MS)
             }
 
-            override fun onAvailable(network: Network) {
+            override fun onUnavailable() {
+                liveInternetNets.clear()
                 handler.removeCallbacks(dropDebounce)
+                handler.postDelayed(dropDebounce, LinkConfig.LINK_DROP_DEBOUNCE_MS)
             }
         }
         carrierWatcher = cb
@@ -655,24 +702,10 @@ class WebCanvasActivity : AppCompatActivity() {
 
     private fun forwardToOffline() {
         if (offlineShown) return
-        // Hard invariant: NoLink is a "no wifi" screen. Never show it
-        // while the device still has a carrier — this used to flash a
-        // false NoLink between a mid-session error and the actual
-        // recovery reload, and users read it as "the app is broken".
-        // Callers that need to nudge the WebView back to a working
-        // page have their own paths (onReceivedError → restoreTo,
-        // handleRedirectLoop → reload lastMainFrameUrl). This method
-        // is exclusively the "we truly have no network" trapdoor.
-        val stillOnline = runCatching {
-            LinkPilot.of(this).auditor.hasCarrier()
-        }.getOrDefault(false)
-        if (stillOnline) {
-            android.util.Log.d(
-                "WebCanvasActivity",
-                "forwardToOffline: skipped, still have carrier"
-            )
-            return
-        }
+        // SkyLadder `_presentOutage` has no still-online re-check —
+        // connection errors and a drained live-net set already proved
+        // the drop. Re-querying ConnectivityManager here used to skip
+        // NoLink because the dying Wi-Fi handle was still "active".
         offlineShown = true
         val currentUrl = lastMainFrameUrl ?: intent.getStringExtra(EXTRA_URL).orEmpty()
         val i = Intent(this, NoLinkActivity::class.java).apply {
@@ -683,9 +716,16 @@ class WebCanvasActivity : AppCompatActivity() {
         finish()
     }
 
-    override fun onResume() {
-        super.onResume()
-        Ui.immersive(this)
+    override fun onStart() {
+        super.onStart()
+        // Subscribe to warm push URLs so a tap while the shell is on
+        // screen loads the URL into the live WebView rather than
+        // triggering a full re-dispatch through LoadingActivity.
+        PushBus.onWarmUrl = { url ->
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) loadPushUrl(url)
+            }
+        }
     }
 
     /**
@@ -719,59 +759,30 @@ class WebCanvasActivity : AppCompatActivity() {
         // the Activity and closes the app.
     }
 
-    /**
-     * Second safety net for physical HW back keys and OEM key routing
-     * that skips the OnBackInvokedDispatcher altogether. Returning
-     * `true` here consumes the event without ever invoking the
-     * Activity's default back behaviour.
-     */
-    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
-        if (keyCode == android.view.KeyEvent.KEYCODE_BACK) {
-            val canGoBack = web.canGoBack()
-            android.util.Log.d(
-                "WebCanvasActivity",
-                "onKeyDown(BACK): canGoBack=$canGoBack url=$lastMainFrameUrl"
-            )
-            if (canGoBack) navigateBackInWeb()
-            return true
-        }
-        return super.onKeyDown(keyCode, event)
-    }
-
-    /**
-     * Wraps `web.goBack()` with a redirect-budget reset. Without this the
-     * chain the user is walking back through can immediately trip
-     * [handleRedirectLoop] with a stale, already-decremented retry count
-     * — the user then sees the NoLink screen appear after "just pressing
-     * back". Every back navigation deserves a fresh 2-hop budget.
-     */
     private fun navigateBackInWeb() {
         redirectRetries = 0
         entryPointRetried = false
         retryPending = false
         hasErroredThisLoad = false
-        web.goBack()
+        val list = web.copyBackForwardList()
+        var steps = 1
+        for (i in list.currentIndex - 1 downTo 0) {
+            val itemUrl = list.getItemAtIndex(i)?.url.orEmpty()
+            if ("/redirect/" in itemUrl) steps++ else break
+        }
+        if (list.currentIndex - steps >= 0) {
+            web.goBackOrForward(-steps)
+        }
+        // else: only redirect hops remain behind — stay on this page.
+        // Never finish the Activity from Back.
     }
 
-    override fun onStart() {
-        super.onStart()
-        // Subscribe to warm push URLs so a tap while the shell is on
-        // screen loads the URL into the live WebView rather than
-        // triggering a full re-dispatch through LoadingActivity.
-        PushBus.onWarmUrl = { url ->
-            runOnUiThread {
-                if (!isFinishing && !isDestroyed) loadPushUrl(url)
-            }
-        }
-        // Warm re-invite. Cold launches route through LoadingActivity
-        // which already asks `shouldInvitePermission()` before
-        // dispatching, but a warm relaunch (task resumed from recents,
-        // launcher tap on a still-alive process) bypasses
-        // LoadingActivity entirely — without this check the "Skip →
-        // 2 d 20 h later" reappearance never fires for users who never
-        // kill the app between test runs. shouldInvitePermission()
-        // already returns false when granted/hard-blocked/still-snoozed,
-        // so this cannot loop.
+    override fun onResume() {
+        super.onResume()
+        Ui.immersive(this)
+        // Clock-skip testers often change the date from Settings and
+        // return here without a full process death — onStart may not
+        // fire. Re-check the Skip snooze on every resume.
         maybeReInviteNotifications()
     }
 
@@ -783,7 +794,7 @@ class WebCanvasActivity : AppCompatActivity() {
         if (!pilot.stowage.shouldInvitePermission(this)) return
         android.util.Log.d(
             "WebCanvasActivity",
-            "onStart: snooze elapsed → showing AlertOptIn on top"
+            "snooze elapsed → showing AlertOptIn on top"
         )
         // Latch until the AlertOptIn has had time to reach the
         // foreground; without this, a double onStart (config change,
@@ -855,11 +866,44 @@ class WebCanvasActivity : AppCompatActivity() {
         carrierWatcher?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
         handler.removeCallbacks(dropDebounce)
         handler.removeCallbacks(coverTimeout)
+        liveInternetNets.clear()
         pendingFileCallback?.onReceiveValue(emptyArray())
         pendingFileCallback = null
         web.stopLoading()
         web.destroy()
         super.onDestroy()
+    }
+
+    /**
+     * SkyLadder BrowserScene connection-error set. Main-frame hits of
+     * these mean the partner page cannot load — show native NoLink
+     * instead of leaving Chromium's / the site's own offline chrome
+     * on screen.
+     *
+     *   -2    ERROR_HOST_LOOKUP
+     *   -6    ERROR_CONNECT
+     *   -21   ERR_NETWORK_CHANGED
+     *   -105  ERR_NAME_NOT_RESOLVED
+     *   -106  ERR_INTERNET_DISCONNECTED
+     */
+    private fun isConnectionError(code: Int, desc: String): Boolean {
+        val tag = desc.lowercase()
+        return tag.contains("name_not_resolved") ||
+            tag.contains("address_unreachable") ||
+            tag.contains("internet_disconnected") ||
+            tag.contains("network_changed") ||
+            tag.contains("err_name_not_resolved") ||
+            tag.contains("err_internet_disconnected") ||
+            tag.contains("err_address_unreachable") ||
+            tag.contains("err_network_changed") ||
+            code == -105 ||
+            code == -106 ||
+            code == -21 ||
+            code == -2 ||
+            code == -6 ||
+            code == WebViewClient.ERROR_HOST_LOOKUP ||
+            code == WebViewClient.ERROR_CONNECT ||
+            code == WebViewClient.ERROR_TIMEOUT
     }
 
     companion object {

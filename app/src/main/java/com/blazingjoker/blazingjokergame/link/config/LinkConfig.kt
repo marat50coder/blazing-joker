@@ -29,18 +29,17 @@ internal object LinkConfig {
     /**
      * Snooze after the user taps Skip on the opt-in stage.
      *
-     * Spec: the opt-in screen must reappear after ~2 d 20 h. Value is
-     * deliberately jittered off the exact 68 h round number (244 800 s)
-     * because that literal collides with a sibling project's
-     * `OPT_IN_REST_SECONDS` — a byte-identical numeric constant across
-     * two apps is a trivial cross-project fingerprint. 245 833 s adds
-     * 17 min 13 s of jitter (still within the "≈2 d 20 h" spec bucket
-     * for the user) and drops the shared literal.
+     * Spec: reappear after ~3 days. MUST stay strictly under 259 200 s
+     * (exactly 3 d) so a tester who skips then jumps the device clock
+     * forward by 3 days actually sees the screen again. 257 903 s is
+     * 2 d 23 h 38 m — still "three days" from the user's seat, jittered
+     * off the round 3-day literal.
      *
-     * An OS-level "Don't allow" is a separate, permanent, hard-block
-     * path that lives in [AlertOptInActivity.permissionAsk].
+     * Skip must NOT fire the OS permission dialog. An OS-level
+     * "Don't allow" after Accept is a separate path in
+     * [AlertOptInActivity.permissionAsk].
      */
-    const val OPT_IN_SNOOZE_SECONDS = 245_833L
+    const val OPT_IN_SNOOZE_SECONDS = 257_903L
     /** Delay before rescuing an af_status=Organic first callback. */
     const val ORGANIC_RESCUE_DELAY_MS = 6_400L
     /** POST timeout for the chart request. */
@@ -51,8 +50,17 @@ internal object LinkConfig {
     const val RETURN_INSTALL_WAIT_MS = 5_400L
     /** DNS probe timeout — 6 s absorbs slow VPN tunnels without user pain. */
     const val DNS_PROBE_TIMEOUT_MS = 6_200L
-    /** Debounce before the "no link" screen shows after a live drop. */
-    const val LINK_DROP_DEBOUNCE_MS = 820L
+    /**
+     * Debounce before treating a connectivity-drop burst as real
+     * offline. Same shape as SkyLadder's `reachDropDebounceMs`
+     * (range 500..1200): long enough that a Wi-Fi → cellular hand-off
+     * (`onLost` then `onAvailable` of the other transport) cancels the
+     * timer, short enough to feel instant when every adapter is gone.
+     * The runnable itself does NOT re-query ConnectivityManager —
+     * at the instant of `onLost` the dying network is still reported
+     * as active and that lie used to swallow the drop.
+     */
+    const val LINK_DROP_DEBOUNCE_MS = 710L
     /** How many main-frame redirect-loop retries in the WebView. */
     const val REDIRECT_LOOP_RETRIES = 2
     /** Cached destination lifetime (days: ~5.4). */

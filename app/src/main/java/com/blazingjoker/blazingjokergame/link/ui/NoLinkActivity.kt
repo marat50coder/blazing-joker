@@ -30,6 +30,7 @@ import com.blazingjoker.blazingjokergame.Ui
 import com.blazingjoker.blazingjokergame.dp
 import com.blazingjoker.blazingjokergame.link.LinkPilot
 import com.blazingjoker.blazingjokergame.link.data.LastCourse
+import kotlinx.coroutines.runBlocking
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -51,6 +52,12 @@ class NoLinkActivity : AppCompatActivity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private val autoRetryFired = AtomicBoolean(false)
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val probeTicker = object : Runnable {
+        override fun run() {
+            armProbe()
+            uiHandler.postDelayed(this, PROBE_TICK_MS)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -175,24 +182,54 @@ class NoLinkActivity : AppCompatActivity() {
         (retry.background as? GradientDrawable)?.cornerRadius = cornerR
     }
 
+    private var retryBusy = false
+
     private fun onRetry() {
-        // Prefer resuming the exact URL the user was on when the link
-        // dropped — that's what `WebCanvasActivity.forwardToOffline`
-        // stashes for us. Going through the full boot pipeline instead
-        // would re-run attribution + chart POST, land on the top of the
-        // configured entry URL, and drop whatever session the user had.
-        // Sibling shells (foollegends OfflinePortal.tryRetry) do this
-        // exact hand-off.
+        if (retryBusy || isFinishing) return
+        retryBusy = true
+        retry.isEnabled = false
+        retry.alpha = 0.55f
+
+        // Probe off the UI thread so a DNS check cannot freeze the
+        // button. If there is no usable internet, stay on this screen —
+        // leaving would flash Loading/WebView and "release" the user
+        // from NoWifi while they are still offline.
+        Thread {
+            val online = runCatching {
+                LinkPilot.of(this).auditor.hasValidatedInternet()
+            }.getOrDefault(false)
+            uiHandler.post {
+                if (isFinishing) return@post
+                if (!online) {
+                    Log.d(TAG, "retry: still offline — stay on NoLink")
+                    retryBusy = false
+                    retry.isEnabled = true
+                    retry.alpha = 1f
+                    return@post
+                }
+                leaveNoLink()
+            }
+        }.start()
+    }
+
+    private fun leaveNoLink() {
         val returnUrl = intent.getStringExtra(EXTRA_RETRY_URL).orEmpty()
         val stowage = LinkPilot.of(this).stowage
         val resumeUrl = returnUrl.ifEmpty { stowage.cachedDestination().orEmpty() }
+        val inviteWanted = stowage.shouldInvitePermission(this)
 
-        val next: Intent = if (resumeUrl.isNotEmpty() && stowage.course == LastCourse.Web) {
-            Intent(this, WebCanvasActivity::class.java).apply {
-                putExtra(WebCanvasActivity.EXTRA_URL, resumeUrl)
+        val next: Intent = when {
+            resumeUrl.isNotEmpty() && inviteWanted -> {
+                Intent(this, AlertOptInActivity::class.java).apply {
+                    putExtra(AlertOptInActivity.EXTRA_DESTINATION_URL, resumeUrl)
+                }
             }
-        } else {
-            Intent(this, LoadingActivity::class.java)
+            resumeUrl.isNotEmpty() && stowage.course == LastCourse.Web -> {
+                Intent(this, WebCanvasActivity::class.java).apply {
+                    putExtra(WebCanvasActivity.EXTRA_URL, resumeUrl)
+                }
+            }
+            else -> Intent(this, LoadingActivity::class.java)
         }
         next.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         startActivity(next)
@@ -217,22 +254,13 @@ class NoLinkActivity : AppCompatActivity() {
     }
 
     /**
-     * Auto-retry: once the OS reports a usable internet transport,
-     * re-run the boot pipeline WITHOUT waiting for the user to tap the
-     * Retry button. Fires at most once per activity resume (guarded by
-     * [autoRetryFired]).
-     *
-     * Rate-limited across the whole app via [lastAutoRetryElapsed] so a
-     * failing AppsFlyer / chart POST that keeps sending the pilot back
-     * to LostSignal → NoLink can't loop the pipeline every few hundred
-     * ms. Real fix for that loop lives in `CampaignBroker.start()` —
-     * this rate limit is just the safety net.
-     *
-     * `NetworkCallback.onAvailable` is fired on registration for every
-     * already-connected network (initial state) AND on every subsequent
-     * transition, so we cannot tell "just registered" apart from "just
-     * flipped" — the interval guard is what keeps the initial firing
-     * from immediately looping.
+     * Auto-retry, SkyLadder OutageScene shape:
+     *   • A live adapter appearing only ARMS a DNS probe — leftover
+     *     cellular with no upstream must not bounce the user back onto
+     *     the partner site's broken offline chrome.
+     *   • A 4 s ticker covers captive-portal Wi-Fi that reports "up"
+     *     before the upstream actually routes.
+     *   • Manual Retry is unchanged.
      */
     private fun registerAutoRetry() {
         if (networkCallback != null) return
@@ -243,29 +271,44 @@ class NoLinkActivity : AppCompatActivity() {
             .build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (!autoRetryFired.compareAndSet(false, true)) return
-                val now = SystemClock.elapsedRealtime()
-                val sinceLast = now - lastAutoRetryElapsed
-                if (sinceLast < MIN_RETRY_INTERVAL_MS) {
-                    val wait = MIN_RETRY_INTERVAL_MS - sinceLast
-                    Log.d(TAG, "network available but only ${sinceLast}ms since last retry — defer $wait ms")
-                    uiHandler.postDelayed({
-                        if (isFinishing) return@postDelayed
-                        lastAutoRetryElapsed = SystemClock.elapsedRealtime()
-                        onRetry()
-                    }, wait)
-                    return
-                }
-                Log.d(TAG, "network available → auto-retrying boot")
-                lastAutoRetryElapsed = now
-                uiHandler.post { if (!isFinishing) onRetry() }
+                Log.d(TAG, "adapter up → arm DNS probe")
+                armProbe()
             }
         }
         runCatching { cm.registerNetworkCallback(request, cb) }
             .onSuccess { networkCallback = cb }
+        uiHandler.removeCallbacks(probeTicker)
+        uiHandler.postDelayed(probeTicker, PROBE_TICK_MS)
+    }
+
+    private fun armProbe() {
+        if (autoRetryFired.get() || isFinishing) return
+        Thread {
+            val ok = runCatching {
+                runBlocking {
+                    val auditor = LinkPilot.of(this@NoLinkActivity).auditor
+                    auditor.hasCarrier() && auditor.canRouteOut()
+                }
+            }.getOrDefault(false)
+            if (!ok) return@Thread
+            uiHandler.post {
+                if (isFinishing) return@post
+                if (!autoRetryFired.compareAndSet(false, true)) return@post
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastAutoRetryElapsed < MIN_RETRY_INTERVAL_MS) {
+                    autoRetryFired.set(false)
+                    Log.d(TAG, "DNS reachable but retry interval not elapsed")
+                    return@post
+                }
+                Log.d(TAG, "DNS reachable → auto-retrying")
+                lastAutoRetryElapsed = now
+                onRetry()
+            }
+        }.start()
     }
 
     private fun unregisterAutoRetry() {
+        uiHandler.removeCallbacks(probeTicker)
         val cb = networkCallback ?: return
         networkCallback = null
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
@@ -283,6 +326,7 @@ class NoLinkActivity : AppCompatActivity() {
          * before we re-invoke the pipeline.
          */
         private const val MIN_RETRY_INTERVAL_MS = 8_000L
+        private const val PROBE_TICK_MS = 4_000L
 
         /**
          * Wall clock of the last auto-retry across ALL NoLink instances

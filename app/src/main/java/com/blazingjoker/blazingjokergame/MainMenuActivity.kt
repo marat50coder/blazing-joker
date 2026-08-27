@@ -119,6 +119,18 @@ class MainMenuActivity : AppCompatActivity() {
         Ui.immersive(this)
     }
 
+    /**
+     * The white part must not exit to the launcher on a back tap from
+     * the main menu — that reads as "the whole game just closed" to a
+     * user who tapped back to dismiss something (keyboard, tooltip,
+     * settings). Swallow the event; the OS home button remains the
+     * only way to leave the game.
+     */
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        Sfx.play(Sfx.CLICK)
+    }
+
     private fun openWeb(title: String, url: String) {
         val i = Intent(this, WebActivity::class.java)
         i.putExtra(WebActivity.EXTRA_TITLE, title)

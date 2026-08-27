@@ -11,6 +11,7 @@
     -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="com.google.android.gms.permission.AD_ID" />
 
@@ -112,7 +113,7 @@
             android:resource="@drawable/ic_link_flame" />
         <meta-data
             android:name="com.google.firebase.messaging.default_notification_channel_id"
-            android:value="@string/link_horn_channel_id" />
+            android:value="bj_link_horn_v1" />
         <meta-data
             android:name="com.google.firebase.messaging.default_notification_color"
             android:resource="@color/link_horn_accent" />

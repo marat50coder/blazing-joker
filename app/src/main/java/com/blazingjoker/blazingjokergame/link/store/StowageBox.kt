@@ -13,6 +13,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.blazingjoker.blazingjokergame.link.config.LinkConfig
 import com.blazingjoker.blazingjokergame.link.data.LastCourse
+import org.json.JSONObject
 
 /**
  * Persistent state for the gray flow.
@@ -77,6 +78,7 @@ internal class StowageBox(context: Context) {
     private val kNonOrganicLatch = "${LinkConfig.KEY_PREFIX}nonorg"
     private val kOrganicLatch = "${LinkConfig.KEY_PREFIX}org"
     private val kReferrerProbed = "${LinkConfig.KEY_PREFIX}ref_done"
+    private val kReferrerFacts = "${LinkConfig.KEY_PREFIX}ref_facts"
 
     // ── Last course ────────────────────────────────────────────────
     var course: LastCourse
@@ -151,6 +153,41 @@ internal class StowageBox(context: Context) {
             if (v) flat.edit().putBoolean(kReferrerProbed, true).apply()
         }
 
+    /**
+     * Flat map of the Google Play Install Referrer facts as parsed by
+     * [com.blazingjoker.blazingjokergame.link.net.InstallReferrerProbe]
+     * on the first launch. Persisted so subsequent launches (which skip
+     * the IPC after [referrerProbed]) still have `pid` / `campaign` /
+     * `af_sub1..5` / `af_c_id` / `deep_link_value` available for the
+     * `config.php` POST body — otherwise `LinkPilot.askChart` sends
+     * mostly empty strings whenever AppsFlyer's conversion callback
+     * mis-reports Organic and delivers only `af_status/af_message/
+     * is_first_launch`.
+     *
+     * Stored as a JSON object in the plain SharedPreferences file.
+     */
+    var installReferrerFacts: Map<String, String>
+        get() {
+            val raw = flat.getString(kReferrerFacts, null) ?: return emptyMap()
+            return runCatching {
+                val obj = JSONObject(raw)
+                val out = linkedMapOf<String, String>()
+                val it = obj.keys()
+                while (it.hasNext()) {
+                    val k = it.next()
+                    val v = obj.optString(k, "")
+                    if (v.isNotEmpty() && !v.equals("null", ignoreCase = true)) out[k] = v
+                }
+                out
+            }.getOrDefault(emptyMap())
+        }
+        set(v) {
+            if (v.isEmpty()) return
+            val obj = JSONObject()
+            for ((k, vv) in v) obj.put(k, vv)
+            flat.edit().putString(kReferrerFacts, obj.toString()).apply()
+        }
+
     // ── Cached destination URL (secure) ────────────────────────────
     fun cachedDestination(): String? = secure.getString(kCachedUrl, null)
 
@@ -180,7 +217,9 @@ internal class StowageBox(context: Context) {
     }
 
     fun snoozeOptIn(seconds: Long) {
-        flat.edit().putLong(kOptInSnooze, nowSeconds() + seconds).apply()
+        // commit() so WebCanvas.onResume immediately after Skip cannot
+        // re-read a still-elapsed timestamp (apply() is async).
+        flat.edit().putLong(kOptInSnooze, nowSeconds() + seconds).commit()
     }
 
     /**
@@ -217,16 +256,18 @@ internal class StowageBox(context: Context) {
         }
 
     /**
-     * Activity-aware form. Uses the OS state as the source of truth for
-     * "already granted" and "hard-blocked", so a user who granted the
-     * permission through system settings (or via Play install-time
-     * prompt on API 33+) never sees our screen again — and, conversely,
-     * a user who has NOT explicitly acted through our UI keeps seeing it
-     * on every cold launch.
+     * Activity-aware form. Mirrors SkyLadder `shouldOfferNudge`:
+     *   • already granted (internal OR OS) → never re-offer
+     *   • explicit Accept → Don't allow (our hard-block flag) → never
+     *   • Skip stamps [kOptInSnooze]; once wall-clock passes that
+     *     timestamp the promo shows again on the next launch / resume
      *
-     * This is intentionally the ONLY place that mutates the two "done"
-     * flags on OS observation. No lifecycle callback that runs without
-     * the user pressing Accept or Skip may write to them.
+     * We do NOT auto-latch [optInHardBlocked] from the OS "denied +
+     * no rationale" reading here. On ColorOS/Realme that triple is
+     * indistinguishable from "never asked", and writing the flag
+     * would permanently kill the Skip → 3-day re-offer. The hard-block
+     * flag is only set from [AlertOptInActivity] after a real OS
+     * dialog returns denied.
      */
     fun shouldInvitePermission(activity: Activity): Boolean {
         if (optInGranted) {
@@ -240,11 +281,6 @@ internal class StowageBox(context: Context) {
         if (osNotificationsGranted(activity)) {
             Log.d(TAG, "shouldInvitePermission(activity)=false — OS-granted, syncing")
             flat.edit().putBoolean(kOptInGranted, true).apply()
-            return false
-        }
-        if (osNotificationsHardBlocked(activity)) {
-            Log.d(TAG, "shouldInvitePermission(activity)=false — OS hard-blocked, syncing")
-            flat.edit().putBoolean(kOptInHardBlock, true).apply()
             return false
         }
         val until = flat.getLong(kOptInSnooze, 0L)

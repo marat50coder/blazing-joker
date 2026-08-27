@@ -5,9 +5,7 @@ import android.content.Context
 import android.os.Bundle
 import android.util.Log
 import com.appsflyer.AFInAppEventType
-import com.appsflyer.AppsFlyerConversionListener
 import com.appsflyer.AppsFlyerLib
-import com.blazingjoker.blazingjokergame.link.data.ShadedTokens
 import com.google.firebase.FirebaseApp
 import com.google.firebase.analytics.FirebaseAnalytics
 import com.google.firebase.analytics.ktx.analytics
@@ -16,10 +14,22 @@ import com.google.firebase.ktx.Firebase
 /**
  * Thin facade in front of the two analytics SDKs the native (white) flow
  * cares about — AppsFlyer for install attribution / lifetime events and
- * Firebase Analytics for in-app event funneling. Both SDKs are
- * initialised on every launch through [bootstrap] from the Application
- * class, independent of the gray-flow's own `CampaignBroker` (which
- * remains gated behind `LinkConfig.credentialsReady`).
+ * Firebase Analytics for in-app event funneling.
+ *
+ * IMPORTANT — AppsFlyer lifecycle:
+ * We deliberately do NOT touch `AppsFlyerLib.init` or `AppsFlyerLib.start`
+ * here. The gray-flow's [com.blazingjoker.blazingjokergame.link.net.CampaignBroker]
+ * owns both — its `wireUp()` runs from Application onCreate to register
+ * the real conversion + deep-link listeners, and its `start(activity)`
+ * fires from LoadingActivity.onResume with a live Activity (which is
+ * mandatory for the conversion listener to fire, per AppsFlyer's own
+ * contract — see the CampaignBroker.start doc-comment). Calling `start`
+ * from Application context or racing the init from two places was the
+ * exact reason `onConversionDataSuccess` stopped firing after the
+ * white→gray merge and every attribution POST body came back with empty
+ * `af_sub*` fields. `AppsFlyerLib.getInstance().logEvent(...)` still
+ * works: the SDK is a singleton and any event we fire from this class
+ * rides on the listener CampaignBroker registered.
  *
  * Consent is respected: when the user flips "Send anonymous analytics"
  * off in Settings, [applyCollectionPreference] pauses AppsFlyer and
@@ -45,18 +55,6 @@ object Analytics {
 
         fa = runCatching { Firebase.analytics }.getOrNull()
         if (fa == null) Log.w(TAG, "Firebase.analytics unavailable — logging is a no-op")
-
-        val afKey = runCatching { ShadedTokens.attributionKey() }.getOrDefault("")
-        if (afKey.isNotEmpty()) {
-            runCatching {
-                val af = AppsFlyerLib.getInstance()
-                af.init(afKey, defaultConversionListener(), app.applicationContext)
-                af.start(app.applicationContext)
-                Log.d(TAG, "AppsFlyer init + start (key length=${afKey.length})")
-            }.onFailure { Log.w(TAG, "AppsFlyer init failed: ${it.message}") }
-        } else {
-            Log.d(TAG, "AppsFlyer key empty — attribution disabled")
-        }
 
         applyCollectionPreference(app, GamePrefs.analyticsEnabled(app))
     }
@@ -123,19 +121,5 @@ object Analytics {
         "game_win" -> AFInAppEventType.ACHIEVEMENT_UNLOCKED
         "game_lose" -> "af_content_view"
         else -> this
-    }
-
-    /**
-     * No-op conversion listener. The gray flow has its own listener in
-     * `CampaignBroker` that overwrites this one when the pilot inits
-     * AppsFlyer for attribution; on the white flow it is enough to
-     * simply have SOME listener so `AppsFlyerLib.init` doesn't warn
-     * about a missing callback.
-     */
-    private fun defaultConversionListener() = object : AppsFlyerConversionListener {
-        override fun onConversionDataSuccess(data: MutableMap<String, Any>?) {}
-        override fun onConversionDataFail(error: String?) {}
-        override fun onAppOpenAttribution(data: MutableMap<String, String>?) {}
-        override fun onAttributionFailure(error: String?) {}
     }
 }
